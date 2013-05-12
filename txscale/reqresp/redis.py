@@ -20,10 +20,10 @@ another for subscribing to responses.
 """
 
 from zope.interface import implementer
-from .interfaces import IServiceEndpoint
+from .interfaces import IResponder
 
 
-@implementer(IServiceEndpoint)
+@implementer(IResponder)
 class RedisServiceEndpoint(object):
 
     def __init__(self, client_endpoint):

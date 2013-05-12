@@ -6,7 +6,7 @@ from zope.interface import implementer
 
 from twisted.internet.defer import Deferred
 
-from txscale.reqresp.interfaces import IClientEndpoint
+from txscale.reqresp.interfaces import IRequester
 
 
 class Request(object):
@@ -15,7 +15,7 @@ class Request(object):
         self.response_deferred = response_deferred
 
 
-@implementer(IClientEndpoint)
+@implementer(IRequester)
 class RequestClient(object):
 
     def __init__(self):

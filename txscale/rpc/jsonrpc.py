@@ -48,7 +48,7 @@ class JSONRPCClient(object):
     def __init__(self, request_response_client):
         """
         @param request_response_client: The request/response client to use as a transport.
-        @type request_response_client: L{txscale.reqresp.interfaces.IClientEndpoint}
+        @type request_response_client: L{txscale.reqresp.interfaces.IRequester}
         """
         self.rr_client = request_response_client
 
