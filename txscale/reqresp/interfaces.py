@@ -1,6 +1,12 @@
 """
 Interfaces for the request/response layer.
 
+A scalable transport is something that can send and receive distinct messages (plain strings).
+IResponder is the request-receiving/response-sending side
+IRequester is the request-sending/response-receiving side
+
+RPC mechanisms (like JSON-RPC, avro, AMP) can be used on top of a scalable transport.
+
 Say you want to use txScale with JSON-RPC over Redis pubsub. Here's the stack:
 
 JSONRequestHandler implements IRequestHandler.
@@ -21,9 +27,9 @@ from zope.interface import Interface, Attribute
 # Big TODO:
 
 # Tubes or producers/consumers should be used to deal with buffering of messages. The interesting
-# thing here is that we shouldn't be limited to buffering for a single or already-extant
-# connection  -- requests should be able to be buffered even before a connection is made, or when
-# a connection has temporarily been lost.
+# thing here is that we shouldn't be limited to buffering for a single or already-extant connection
+# -- requests should be able to be buffered even before a connection is made, or when a connection
+# has temporarily been lost.
 
 # On top of that, I want to make sure that unchecked sending of requests is eventually shut down
 # with a "reasonable" (and configurable) limit. I've had production systems fall over when too many
@@ -48,7 +54,8 @@ class IRequestHandler(Interface):
         @param data: The request data.
         @type data: C{str}
 
-        @return: The result that should be sent back to the client.  If None, then no response will be sent.  To send an acknowledgement of receipt with no content, return an empty
+        @return: The result that should be sent back to the client.  If None, then no response will
+            be sent.  To send an acknowledgement of receipt with no content, return an empty
             string.
         @rtype: C{str} or C{None}
         """
