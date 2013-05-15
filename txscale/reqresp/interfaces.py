@@ -81,7 +81,9 @@ class IResponder(Interface):
 
     def stop(self):
         """
-        Stop listening for requests.
+        Stop listening for requests, and do whatever else is necessary to gracefully shut down.
+
+        @return: A Deferred that fires when all outstanding requests have been responded to.
         """
 
 

@@ -14,13 +14,14 @@ import json
 from zope.interface import implementer
 
 from twisted.internet.defer import maybeDeferred
+from twisted.python import log
 
 from txscale.reqresp.interfaces import IRequestHandler
 
 
 class ServiceAPIError(Exception):
     """
-    Raised when a JSON-RPC response indicates an error.
+    Raised to client callers when the server gave sent an error response.
     """
     def __init__(self, method, code, message, data):
         self.method = method
@@ -102,7 +103,7 @@ class JSONRequestHandler(object):
         params = payload["params"]
         result = maybeDeferred(self.method_handler.gotRequest, method, **params)
         result.addCallback(self._gotResult)
-        result.addErrback(self._gotError)
+        result.addErrback(self._gotError, method, params)
         result.addCallback(json.dumps)
         return result
 
@@ -119,7 +120,8 @@ class JSONRequestHandler(object):
             "id": 1
         }
 
-    def _gotError(self, failure):
+    def _gotError(self, failure, method, params):
+        log.err(failure, "Error while handling %s %s" % (method, params))  # XXX test this
         # TODO: Only include tracebacks in private/debug services!
         if hasattr(failure.value, "json_rpc_error_code"):
             error_code = failure.value.json_rpc_error_code
