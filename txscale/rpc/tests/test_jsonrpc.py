@@ -4,9 +4,9 @@ from twisted.trial.unittest import TestCase
 from twisted.internet.defer import Deferred
 from twisted.python.failure import Failure
 
-from txscale.reqresp.testing import RequestClient
-from txscale.rpc.jsonrpc import (JSONRPCClient, ServiceAPIError, JSONRequestHandler, MethodHandler,
-                                 HandlerNotFound)
+from ...reqresp.testing import RequestClient
+from ..jsonrpc import (JSONRPCClient, ServiceAPIError, JSONRequestHandler, MethodHandler,
+                       HandlerNotFound)
 
 
 class JSONRPCClientTests(TestCase):

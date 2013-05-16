@@ -12,17 +12,17 @@ Say you want to use txScale with JSON-RPC over Redis pubsub. Here's the stack:
 JSONRequestHandler implements IRequestHandler.
     This parses and dispatches JSON-RPC requests from and sends responses to an IResponder.
     It dispatches to an implementation-defined handler where your application code lives.
-RedisServiceEndpoint implements IResponder.
+RedisResponder implements IResponder.
     This handles requests with raw string payloads coming from Redis pubsub.
 
 JSONRPCClient is just a class with an implementation-defined interface.
     Application code calls this to send JSON-RPC requests to and receives responses from an
     IRequester.
-RedisClientEndpoint implements IRequester.
+RedisRequester implements IRequester.
     This sends requests with raw string payloads to Redis pubsub.
 """
 
-from zope.interface import Interface, Attribute
+from zope.interface import Interface
 
 # Big TODO:
 

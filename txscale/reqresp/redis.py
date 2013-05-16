@@ -57,35 +57,13 @@ from .interfaces import IResponder, IRequester
 from .messages import splitRequest, splitResponse, generateRequest, generateResponse
 
 
-class _Subscriber(RedisSubscriber):
-
-    def __init__(self, manager):
-        super(_Subscriber, self).__init__()
-        self.manager = manager
-
-    def connectionMade(self):
-        super(_Subscriber, self).connectionMade()
-        self.manager._saveSubscriptionConnection(self)
-
-    def connectionLost(self, reason):
-        self.manager._removeSubscriptionConnection()
-
-    def messageReceived(self, channel, message):
-        self.manager._messageReceived(channel, message)
-
-
-class _Publisher(Redis):
-
-    def __init__(self, manager):
-        super(_Publisher, self).__init__()
-        self.manager = manager
-
-    def connectionMade(self):
-        super(_Publisher, self).connectionMade()
-        self.manager._savePublishingConnection(self)
-
-    def connectionLost(self, reason):
-        self.manager._removePublishingConnection()
+def watchProtocol(protocol, connectionMade, connectionLost):
+    """
+    Hook into a Protocol's connectionLost and connectionMade to invoke callbacks.
+    """
+    protocol.connectionMade = lambda: connectionMade(protocol)
+    protocol.connectionLost = lambda reason: connectionLost(protocol)
+    return protocol
 
 
 def unregisterServiceInstance(publishing_protocol, service_name, channel):
@@ -99,7 +77,9 @@ def unregisterServiceInstance(publishing_protocol, service_name, channel):
 @implementer(IResponder)
 class RedisResponder(object):
 
-    def __init__(self, redis_endpoint):
+    def __init__(self, redis_endpoint,
+                 _redis_subscriber=RedisSubscriber,
+                 _redis=Redis):
         """
         @param redis_endpoint: A L{IStreamClientEndpoint} pointing at a Redis server.
         """
@@ -109,6 +89,8 @@ class RedisResponder(object):
         self._response_protocol = None
         self.uuid = uuid4().hex
         self._waiting_results = set()  # deferreds that we're still waiting to fire
+        self._redis_subscriber = _redis_subscriber
+        self._redis = _redis
 
     def listen(self, name, handler):
         """
@@ -121,16 +103,21 @@ class RedisResponder(object):
         self.service_management_channel = "txscale." + name + ".service-management"
         # XXX error reporting
         sf = ReconnectingClientFactory()
-        sf.protocol = lambda: _Subscriber(self)
+        sf.protocol = lambda: watchProtocol(self._redis_subscriber(),
+                                            self._saveSubscriptionConnection,
+                                            self._removeSubscriptionConnection)
         self.redis_endpoint.connect(sf)
         pf = ReconnectingClientFactory()
-        pf.protocol = lambda: _Publisher(self)
+        pf.protocol = lambda: watchProtocol(self._redis(),
+                                            self._savePublishingConnection,
+                                            self._removePublishingConnection)
         self.redis_endpoint.connect(pf)
         self.handler = handler
 
     def _saveSubscriptionConnection(self, protocol):
         # XXX log
         print "subscribing to", self.channel
+        protocol.messageReceived = self._messageReceived
         protocol.subscribe(self.channel)
         self._subscription_protocol = protocol
 
@@ -143,20 +130,20 @@ class RedisResponder(object):
         for d, response_channel, data in self._response_queue:
             d.chainDeferred(self._response_protocol.publish(response_channel, data))
 
+    def _removeSubscriptionConnection(self, protocol):
+        # XXX log
+        self._subscription_protocol = None
+
+    def _removePublishingConnection(self, protocol):
+        # XXX log
+        self._response_protocol = None
+
     def _registerServer(self):
         """
         Save this server's UUID in the txscale.<name> set, so clients know what listeners they can
         talk to.
         """
         self._response_protocol.sadd("txscale." + self.name, self.channel)
-
-    def _removeSubscriptionConnection(self):
-        # XXX log
-        self._subscription_protocol = None
-
-    def _removePublishingConnection(self):
-        # XXX log
-        self._response_protocol = None
 
     def _messageReceived(self, channel, data):
         if data.startswith("ping "):
@@ -224,7 +211,9 @@ WTF, how come this happens sometimes?
 class RedisRequester(object):
 
     def __init__(self, service_name, redis_endpoint, clock, total_timeout=3.0,
-                 after_request_timeout=1.0, service_disappeared_timeout=10):
+                 after_request_timeout=1.0, service_disappeared_timeout=10,
+                 _redis_subscriber=RedisSubscriber,
+                 _redis=Redis):
         """
         @type clock: L{IReactorTime}
         @param clock: Typically, C{twisted.internet.reactor}.
@@ -236,6 +225,8 @@ class RedisRequester(object):
         @param redis_endpoint: An endpoint pointing at a Redis server.
         @type redis_endpoint: L{IStreamClientEndpoint}.
         """
+        self._redis_subscriber = _redis_subscriber
+        self._redis = _redis
         self.clock = clock
         self.service_management_channel = "txscale." + service_name + ".service-management"
         self.service_channels = set()
@@ -243,10 +234,14 @@ class RedisRequester(object):
         self.service_name = service_name
         # XXX error reporting
         sf = ReconnectingClientFactory()
-        sf.protocol = lambda: _Subscriber(self)
+        sf.protocol = lambda: watchProtocol(self._redis(),
+                                            self._savePublishingConnection,
+                                            self._removePublishingConnection)
         self.redis_endpoint.connect(sf)
         pf = ReconnectingClientFactory()
-        pf.protocol = lambda: _Publisher(self)
+        pf.protocol = lambda: watchProtocol(self._redis_subscriber(),
+                                            self._saveSubscriptionConnection,
+                                            self._removeSubscriptionConnection)
         self.redis_endpoint.connect(pf)
         self.client_channel = "txscale-client.%s.%s" % (service_name, uuid4().hex)
         self._request_queue = []
@@ -322,6 +317,7 @@ class RedisRequester(object):
         """
         channel = self._getServiceChannel()
         request.setChannel(channel)
+        # XXX this should handle the case of _request_protocol being None
         self._request_protocol.publish(channel, request.message)
         request.startTimeOut(self.after_request_timeout)
 
@@ -345,13 +341,14 @@ class RedisRequester(object):
     def _saveSubscriptionConnection(self, protocol):
         def subscribed(r):
             self._response_protocol = protocol
+        protocol.messageReceived = self._messageReceived
         protocol.subscribe(self.client_channel, self.service_management_channel)
         protocol.getResponse().addCallback(subscribed)  # XXX oh god testing
 
-    def _removePublishingConnection(self):
+    def _removePublishingConnection(self, protocol):
         self._request_protocol = None
 
-    def _removeSubscriptionConnection(self):
+    def _removeSubscriptionConnection(self, protocol):
         self._response_protocol = None
 
     def _messageReceived(self, channel, data):
