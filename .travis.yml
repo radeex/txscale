@@ -4,5 +4,5 @@ python:
 install:
     - pip install twisted --use-mirrors
 script:
-    - trial txscale
+    - trial -j2 txscale
 

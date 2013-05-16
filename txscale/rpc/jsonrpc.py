@@ -121,7 +121,7 @@ class JSONRequestHandler(object):
         }
 
     def _gotError(self, failure, method, params):
-        log.err(failure, "Error while handling %s %s" % (method, params))
+        log.err(failure, ("Error while handling %s %s" % (method, params)).encode("utf-8"))
         # TODO: Only include tracebacks in private/debug services!
         if hasattr(failure.value, "json_rpc_error_code"):
             error_code = failure.value.json_rpc_error_code
