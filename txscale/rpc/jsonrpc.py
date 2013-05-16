@@ -29,7 +29,7 @@ class ServiceAPIError(Exception):
         self.message = message
         self.data = data
         return super(ServiceAPIError, self).__init__(
-            "Error %s from method %s: %s\n%s"% (code, method, message, data))
+            "Error %s from method %s: %s\n%s" % (code, method, message, data))
 
 
 class HandlerNotFound(Exception):
@@ -121,7 +121,7 @@ class JSONRequestHandler(object):
         }
 
     def _gotError(self, failure, method, params):
-        log.err(failure, "Error while handling %s %s" % (method, params))  # XXX test this
+        log.err(failure, "Error while handling %s %s" % (method, params))
         # TODO: Only include tracebacks in private/debug services!
         if hasattr(failure.value, "json_rpc_error_code"):
             error_code = failure.value.json_rpc_error_code

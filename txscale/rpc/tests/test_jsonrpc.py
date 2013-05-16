@@ -137,6 +137,7 @@ class JSONRequestHandlerTests(TestCase):
             "id": 1
         }
         self.assertEqual(loads(ultimate), expected)
+        self.flushLoggedErrors(ZeroDivisionError)
 
     def test_synchronous_error_result_sending(self):
         """
@@ -144,13 +145,12 @@ class JSONRequestHandlerTests(TestCase):
         as failures.
         """
         request = {"method": "foo", "params": {}}
-        def gotRequest(method, **params):
-            1 / 0
-        self.method_handler.gotRequest = gotRequest
+        self.method_handler.gotRequest = lambda method, **params: 1 / 0
 
         handler_result = self.request_handler.handle(dumps(request))
         ultimate = self.successResultOf(handler_result)
         self.assertEqual(loads(ultimate)["error"]["message"], "integer division or modulo by zero")
+        self.flushLoggedErrors(ZeroDivisionError)
 
     def test_error_result_sending_with_custom_json_error_code(self):
         """
@@ -164,6 +164,23 @@ class JSONRequestHandlerTests(TestCase):
         handler_result.errback(exception)
         ultimate = self.successResultOf(handler_result)
         self.assertEqual(loads(ultimate)["error"]["code"], 55)
+        self.flushLoggedErrors(ZeroDivisionError)
+
+    def test_error_logging(self):
+        """Exceptions raised from a handler are logged."""
+        request = {"method": "foo", "params": {}}
+        self.method_handler.gotRequest = lambda method, **params: 1 / 0
+        self.request_handler.handle(dumps(request))
+        [failure] = self.flushLoggedErrors(ZeroDivisionError)
+        failure.trap(ZeroDivisionError)
+
+    def test_asynchronous_error_logging(self):
+        """Failing Deferreds returned from a handler are logged."""
+        request = {"method": "foo", "params": {}}
+        handler_result = self.request_handler.handle(dumps(request))
+        handler_result.errback(Failure(ZeroDivisionError("heyo")))
+        [failure] = self.flushLoggedErrors(ZeroDivisionError)
+        failure.trap(ZeroDivisionError)
 
 
 class MethodHandlerTests(TestCase):
