@@ -6,5 +6,5 @@ install:
     - pip install twisted --use-mirrors
     - pip install txredis --use-mirrors
 script:
-    - trial -j2 txscale
+    - ./travis-test.sh
 
