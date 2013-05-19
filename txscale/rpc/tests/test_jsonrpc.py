@@ -130,7 +130,7 @@ class JSONRequestHandlerTests(TestCase):
             "jsonrpc": "2.0",
             "error": {
                 "code": -32000,
-                "message": "heyo",
+                "message": "ZeroDivisionError: heyo",
                 "data": ("Traceback (most recent call last):\n"
                          "Failure: exceptions.ZeroDivisionError: heyo\n")
             },
@@ -145,12 +145,14 @@ class JSONRequestHandlerTests(TestCase):
         as failures.
         """
         request = {"method": "foo", "params": {}}
-        self.method_handler.gotRequest = lambda method, **params: 1 / 0
+        def gotRequest(method, **params):
+            raise RuntimeError("foo bar")
+        self.method_handler.gotRequest = gotRequest
 
         handler_result = self.request_handler.handle(dumps(request))
         ultimate = self.successResultOf(handler_result)
-        self.assertEqual(loads(ultimate)["error"]["message"], "integer division or modulo by zero")
-        self.flushLoggedErrors(ZeroDivisionError)
+        self.assertEqual(loads(ultimate)["error"]["message"], "RuntimeError: foo bar")
+        self.flushLoggedErrors(RuntimeError)
 
     def test_error_result_sending_with_custom_json_error_code(self):
         """

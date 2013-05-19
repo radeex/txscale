@@ -127,11 +127,12 @@ class JSONRequestHandler(object):
             error_code = failure.value.json_rpc_error_code
         else:
             error_code = -32000
+        error_message = "%s: %s" % (type(failure.value).__name__, failure.getErrorMessage())
         return {
             "jsonrpc": "2.0",
             "error": {
                 "code": error_code,
-                "message": failure.getErrorMessage(),
+                "message": error_message,
                 "data": failure.getTraceback()
             },
             "id": 1
