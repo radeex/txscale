@@ -1,8 +1,9 @@
 language: python
 python:
     - "2.7"
+    - "pypy"
 install:
-    - sudo apt-get install python-twisted
+    - pip install twisted --use-mirrors
     - pip install txredis --use-mirrors
 script:
     - trial -j2 txscale
