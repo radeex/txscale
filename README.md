@@ -1,4 +1,4 @@
-#txScale
+#txScale (real name TBD)
 
 This package aims to provide the following overarching features, tightly
 integrated with Twisted.
