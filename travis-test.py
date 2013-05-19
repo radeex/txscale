@@ -6,6 +6,6 @@ import platform, os
 
 if platform.python_implementation() == "PyPy":
     # Travis installs pypy as "python" so we don't need to do anything special to use it.
-    os.system("trial txscale")
+    os.execvp("trial", ["trial", "txscale"])
 else:
-    os.system("trial -j2 txscale")
+    os.execvp("trial", ["trial", "-j2", "txscale"])
