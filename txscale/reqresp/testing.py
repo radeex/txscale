@@ -6,7 +6,7 @@ from zope.interface import implementer
 
 from twisted.internet.defer import Deferred
 
-from txscale.reqresp.interfaces import IRequester
+from .interfaces import IRequester
 
 
 class Request(object):

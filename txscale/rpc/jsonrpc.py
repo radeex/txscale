@@ -16,7 +16,7 @@ from zope.interface import implementer
 from twisted.internet.defer import maybeDeferred
 from twisted.python import log
 
-from txscale.reqresp.interfaces import IRequestHandler
+from ..reqresp.interfaces import IRequestHandler
 
 
 class ServiceAPIError(Exception):
