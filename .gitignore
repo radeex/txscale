@@ -33,4 +33,9 @@ nosetests.xml
 .mr.developer.cfg
 .project
 .pydevproject
+
+# Sublime
 *.sublime-workspace
+
+# Twisted
+_trial_temp
