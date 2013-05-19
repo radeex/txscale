@@ -48,6 +48,7 @@ from uuid import uuid4
 from zope.interface import implementer
 
 from twisted.python import log
+from twisted.python.failure import Failure
 from twisted.internet.protocol import ReconnectingClientFactory
 from twisted.internet.defer import Deferred, gatherResults
 
@@ -55,6 +56,39 @@ from txredis.protocol import Redis, RedisSubscriber
 
 from .interfaces import IResponder, IRequester
 from .messages import splitRequest, splitResponse, generateRequest, generateResponse
+
+
+class NoServiceError(Exception):
+    """No service instances are listening."""
+    def __init__(self, service_name):
+        self.service_name = service_name
+        super(NoServiceError, self).__init__(
+            "No services are listening on txscale.%s." % (service_name,))
+
+
+class TimeOutError(Exception):
+    """Timed out."""
+
+    def __init__(self, request):
+        self.request = request
+        super(TimeOutError, self).__init__(
+            "Request timed out after %s: %r" % (self.request.after_request_timeout, self.request))
+
+
+class ServiceGracefullyDisappearedError(Exception):
+    """
+    A service (instance) disappeared while waiting for a response.
+
+    This is raised when a service has gracefully shut down and sent the client a message indicating
+    that it has done so.  Given that services must complete processing of all received messages
+    before broadcasting the message indicating it has shut down, that means the service must not
+    have received the request in the first place.  Thus, retrying a request in the case of this
+    exception is reasonable.
+    """
+    def __init__(self, request):
+        self.request = request
+        super(ServiceGracefullyDisappearedError, self).__init__(
+            "Service disappeared while waiting for response to request %r" % (self.request))
 
 
 def watchProtocol(protocol, connectionMade, connectionLost):
@@ -76,6 +110,7 @@ def unregisterServiceInstance(publishing_protocol, service_name, channel):
 
 @implementer(IResponder)
 class RedisResponder(object):
+    """The Redis responder."""
 
     def __init__(self, redis_endpoint,
                  _redis_subscriber=RedisSubscriber,
@@ -151,12 +186,12 @@ class RedisResponder(object):
             self._response_protocol.publish(response_channel, "pong %s" % (self.channel,))
             return
         try:
-            message_id, response_channel, message = splitRequest(data)
+            request = splitRequest(data)
         except:
             print "ERROR PARSING REQUEST", repr(data)
             raise
-        d = self.handler.handle(message)  # XXX maybeDeferred?
-        d.addCallback(self._sendResponse, message_id, response_channel)
+        d = self.handler.handle(request.data)  # XXX maybeDeferred?
+        d.addCallback(self._sendResponse, request.message_id, request.response_channel)
         self._waiting_results.add(d)
         d.addErrback(log.err) # XXX yessss
         d.addCallback(lambda ignored: self._waiting_results.remove(d))
@@ -210,7 +245,7 @@ WTF, how come this happens sometimes?
 @implementer(IRequester)
 class RedisRequester(object):
 
-    def __init__(self, service_name, redis_endpoint, clock, total_timeout=3.0,
+    def __init__(self, service_name, redis_endpoint, clock,  # total_timeout=3.0,
                  after_request_timeout=1.0, service_disappeared_timeout=10,
                  _redis_subscriber=RedisSubscriber,
                  _redis=Redis):
@@ -218,8 +253,8 @@ class RedisRequester(object):
         @type clock: L{IReactorTime}
         @param clock: Typically, C{twisted.internet.reactor}.
         @param service_name: The name of the service to which we will connect.
-        @param total_timeout: The number of seconds to wait after L{request} is invoked to trigger
-            a timeout.
+        # @param total_timeout: The number of seconds to wait after L{request} is invoked to trigger
+        #     a timeout.
         @param after_request_timeout: The number of seconds to wait after the request has actually
             been published to trigger a timeout.
         @param redis_endpoint: An endpoint pointing at a Redis server.
@@ -232,6 +267,23 @@ class RedisRequester(object):
         self.service_channels = set()
         self.redis_endpoint = redis_endpoint
         self.service_name = service_name
+        self.client_channel = "txscale-client.%s.%s" % (service_name, uuid4().hex)
+        self._request_queue = []
+        self._request_protocol = None
+        self._response_protocol = None
+        self._outstanding_requests = {}  # msg-id -> _ClientRequest
+        # self.total_timeout = total_timeout  # XXX implement
+        self.after_request_timeout = after_request_timeout
+        self.service_disappeared_timeout = service_disappeared_timeout
+        self.timeout_blacklist = set()
+        self._service_timeout_delayed_calls = {}
+
+        self._connecting = False
+
+    def _ensureConnection(self):
+        if self._connecting:
+            return
+        self._connecting = True
         # XXX error reporting
         sf = ReconnectingClientFactory()
         sf.protocol = lambda: watchProtocol(self._redis(),
@@ -243,22 +295,14 @@ class RedisRequester(object):
                                             self._saveSubscriptionConnection,
                                             self._removeSubscriptionConnection)
         self.redis_endpoint.connect(pf)
-        self.client_channel = "txscale-client.%s.%s" % (service_name, uuid4().hex)
-        self._request_queue = []
-        self._request_protocol = None
-        self._response_protocol = None
-        self._outstanding_requests = {}  # msg-id -> _ClientRequest
-        self.total_timeout = total_timeout  # XXX implement
-        self.after_request_timeout = after_request_timeout
-        self.service_disappeared_timeout = service_disappeared_timeout
-        self.timeout_blacklist = set()
-        self._service_timeout_delayed_calls = {}
 
     def _getServiceChannel(self):
         # XXX handle the case for no channels
         # XXX blacklist shouldn't be a strict blacklist if there's nothing else to choose
         # XXX queue messages if there's nothing available
         channels = self.service_channels - self.timeout_blacklist
+        if not channels:
+            raise NoServiceError(self.service_name)
         return random.sample(channels, 1)[0]
 
     def request(self, data):
@@ -272,6 +316,7 @@ class RedisRequester(object):
 
         Sometimes, though, we won't even get one of those (the server's cable was unplugged).
         """
+        self._ensureConnection()
         message_id, message = generateRequest(self.client_channel, data)
         request = _ClientRequest(self.clock, message_id, message)
         self._outstanding_requests[message_id] = request
@@ -315,7 +360,11 @@ class RedisRequester(object):
         Publish the message to the connected protocol, and start the C{after_request_timeout}
         ticking.
         """
-        channel = self._getServiceChannel()
+        try:
+            channel = self._getServiceChannel()
+        except:
+            request.fail(Failure())
+            return
         request.setChannel(channel)
         # XXX this should handle the case of _request_protocol being None
         self._request_protocol.publish(channel, request.message)
@@ -379,31 +428,6 @@ class RedisRequester(object):
             self._outstanding_requests[message_id].succeed(message)
 
 
-class TimeOutError(Exception):
-    """Timed out."""
-
-    def __init__(self, request):
-        self.request = request
-        super(TimeOutError, self).__init__(
-            "Request timed out after %s: %r" % (self.request.after_request_timeout, self.request))
-
-
-class ServiceGracefullyDisappearedError(Exception):
-    """
-    A service (instance) disappeared while waiting for a response.
-
-    This is raised when a service has gracefully shut down and sent the client a message indicating
-    that it has done so.  Given that services must complete processing of all received messages
-    before broadcasting the message indicating it has shut down, that means the service must not
-    have received the request in the first place.  Thus, retrying a request in the case of this
-    exception is reasonable.
-    """
-    def __init__(self, request):
-        self.request = request
-        super(ServiceGracefullyDisappearedError, self).__init__(
-            "Service disappeared while waiting for response to request %r" % (self.request))
-
-
 class _ClientRequest(object):
     def __init__(self, clock, message_id, message):
         self.clock = clock
@@ -431,7 +455,7 @@ class _ClientRequest(object):
         self.result_deferred.callback(result)
 
     def fail(self, failure):
-        if self._call.active():
+        if self._call is not None and self._call.active():
             self._call.cancel()
         self.result_deferred.errback(failure)
 

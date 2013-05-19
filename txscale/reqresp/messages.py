@@ -6,12 +6,17 @@ messages, but they're useful if the low-level protocol is binary-safe.
 """
 
 from uuid import uuid4
+from collections import namedtuple
+
+
+Request = namedtuple("request", ["message_id", "response_channel", "data"])
+Response = namedtuple("response", ["message_id", "data"])
 
 
 def splitRequest(message, delimeter=":"):
     message_id = message[:16]
     response_channel, data = message[16:].split(delimeter, 1)
-    return message_id, response_channel, data
+    return Request(message_id, response_channel, data)
 
 
 def generateRequest(response_channel, data, delimeter=":"):
@@ -24,4 +29,4 @@ def generateResponse(message_id, data):
 
 
 def splitResponse(data):
-    return data[:16], data[16:]
+    return Response(data[:16], data[16:])
