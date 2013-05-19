@@ -1,4 +1,3 @@
-#!/usr/bin/python
 # this script just exists for Travis-CI: pypy doesn't support "-j" so I have to check which python
 # implementation is running.
 
