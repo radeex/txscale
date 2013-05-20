@@ -1,6 +1,17 @@
 """
 Redis request/response support.
 
+Pros:
+ - you can deploy it on Redis
+
+Cons:
+ - Unreliable:
+   - If a client gets temporarily disconnected after it sends a request, it might miss the
+     response.
+   - Servers might pull a message off the stack and then not respond to it, even in graceful
+     shutdown. But at least the client will know that it wasn't processed: see
+     L{ServiceGracefullyDisappearedError}.
+
 Redis pubsub really really simple, and good at what it does, but message routing needs more than
 pubsub.  This means we have to add a significant amount of bookkeeping on top of the basic pubsub
 functionality in order to get a reliable, scalable, dynamic message routing system.
@@ -69,10 +80,12 @@ class NoServiceError(Exception):
 class TimeOutError(Exception):
     """Timed out."""
 
-    def __init__(self, request):
+    def __init__(self, timeout_type, timeout_value, request):
         self.request = request
+        self.timeout_type = timeout_type
+        self.timeout_value = timeout_value
         super(TimeOutError, self).__init__(
-            "Request timed out after %s: %r" % (self.request.after_request_timeout, self.request))
+            "Request reached %s of %s: %r" % (timeout_type, timeout_value, request))
 
 
 class ServiceGracefullyDisappearedError(Exception):
@@ -245,7 +258,7 @@ WTF, how come this happens sometimes?
 @implementer(IRequester)
 class RedisRequester(object):
 
-    def __init__(self, service_name, redis_endpoint, clock,  # total_timeout=3.0,
+    def __init__(self, service_name, redis_endpoint, clock,  total_timeout=3.0,
                  after_request_timeout=1.0, service_disappeared_timeout=10,
                  _redis_subscriber=RedisSubscriber,
                  _redis=Redis):
@@ -272,7 +285,7 @@ class RedisRequester(object):
         self._request_protocol = None
         self._response_protocol = None
         self._outstanding_requests = {}  # msg-id -> _ClientRequest
-        # self.total_timeout = total_timeout  # XXX implement
+        self.total_timeout = total_timeout
         self.after_request_timeout = after_request_timeout
         self.service_disappeared_timeout = service_disappeared_timeout
         self.timeout_blacklist = set()
@@ -318,7 +331,7 @@ class RedisRequester(object):
         """
         self._ensureConnection()
         message_id, message = generateRequest(self.client_channel, data)
-        request = _ClientRequest(self.clock, message_id, message)
+        request = _ClientRequest(self.clock, message_id, message, self.total_timeout)
         self._outstanding_requests[message_id] = request
         if self._request_protocol is not None:
             self._publishConnected(request)
@@ -346,11 +359,12 @@ class RedisRequester(object):
         if channel in self._service_timeout_delayed_calls:
             print "already sent ping"
             return
-        print "pinging service at channel %s to determine if it's still there" % (channel,)
-        self._request_protocol.publish(channel, "ping %s" % (self.client_channel,))
-        delayed_call = self.clock.callLater(10, self._unregisterServiceInstance, channel)
-        self._service_timeout_delayed_calls[channel] = delayed_call
-        self.timeout_blacklist.add(channel)
+        if self._request_protocol is not None:
+            print "pinging service at channel %s to determine if it's still there" % (channel,)
+            self._request_protocol.publish(channel, "ping %s" % (self.client_channel,))
+            delayed_call = self.clock.callLater(10, self._unregisterServiceInstance, channel)
+            self._service_timeout_delayed_calls[channel] = delayed_call
+            self.timeout_blacklist.add(channel)
 
     def _unregisterServiceInstance(self, channel):
         unregisterServiceInstance(self._request_protocol, self.service_name, channel)
@@ -398,6 +412,7 @@ class RedisRequester(object):
         self._request_protocol = None
 
     def _removeSubscriptionConnection(self, protocol):
+        # XXX log
         self._response_protocol = None
 
     def _messageReceived(self, channel, data):
@@ -420,23 +435,32 @@ class RedisRequester(object):
                 channel = data.split(" ", 1)[1]
                 self.timeout_blacklist.discard(channel)
                 if channel in self._service_timeout_delayed_calls:
+                    # XXX WE NEED TO REMOVE THIS CALL FROM THE DICT
                     call = self._service_timeout_delayed_calls[channel]
                     if call.active():
                         call.cancel()
                 return
             message_id, message = splitResponse(data)
-            self._outstanding_requests[message_id].succeed(message)
+            if message_id not in self._outstanding_requests:
+                log.msg(
+                    "Got unexpected response to message-id %r. Maybe the request timed out?",
+                    message_id=message_id)
+            else:
+                self._outstanding_requests[message_id].succeed(message)
 
 
 class _ClientRequest(object):
-    def __init__(self, clock, message_id, message):
+    def __init__(self, clock, message_id, message, total_timeout):
         self.clock = clock
         self.message_id = message_id
         self.result_deferred = Deferred()
         self.channel = None
         self.message = message
-        self._call = None
         self.after_request_timeout = None
+        self._after_request_timeout_call = None
+        self.total_timeout = total_timeout
+        self._total_timeout_call = self.clock.callLater(
+            self.total_timeout, self._timedOut, "total_timeout", total_timeout)
 
     def setChannel(self, channel):
         """Record the channel on which this request is being sent."""
@@ -444,23 +468,27 @@ class _ClientRequest(object):
 
     def startTimeOut(self, timeout):
         self.after_request_timeout = timeout
-        self._call = self.clock.callLater(timeout, self._timedOut)
+        self._call = self.clock.callLater(
+            timeout, self._timedOut, "after_request_timeout", self.after_request_timeout)
 
-    def _timedOut(self):
-        self.result_deferred.errback(TimeOutError(self))
+    def _timedOut(self, timeout_type, timeout_value):
+        self.result_deferred.errback(TimeOutError(timeout_type, timeout_value, self))
+
+    def _cancel_timeouts(self):
+        for call in (self._total_timeout_call, self._after_request_timeout_call):
+            if call is not None and call.active():
+                call.cancel()
 
     def succeed(self, result):
-        if self._call.active():
-            self._call.cancel()
+        self._cancel_timeouts()
         self.result_deferred.callback(result)
 
     def fail(self, failure):
-        if self._call is not None and self._call.active():
-            self._call.cancel()
+        self._cancel_timeouts()
         self.result_deferred.errback(failure)
 
     def __repr__(self):
-        return "<ClientRequest message_id=%r channel=%s>" % (self.message_id, self.channel)
+        return "<_ClientRequest message_id=%r channel=%s>" % (self.message_id, self.channel)
 
     def __str__(self):
         return repr(self)

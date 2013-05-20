@@ -4,7 +4,7 @@ from twisted.trial.unittest import TestCase
 from twisted.internet.task import Clock
 from twisted.internet.defer import succeed
 
-from ..redis import RedisResponder, RedisRequester, NoServiceError
+from ..redis import RedisResponder, RedisRequester, NoServiceError, TimeOutError
 from ..messages import splitRequest
 
 # TODO:
@@ -66,13 +66,15 @@ class FakeRedisSubscriber(object):
 class FakeEndpoint(object):
     """A fake L{IStreamClientEndpoint} that keeps track of connected factories."""
 
-    def __init__(self):
+    def __init__(self, auto_connect=True):
         self.protos = {}
+        self.auto_connect = auto_connect
 
     def connect(self, factory):
         protocol = factory.buildProtocol(None)
         self.protos[protocol.name] = protocol
-        protocol.connectionMade()
+        if self.auto_connect:
+            protocol.connectionMade()
 
 
 class RedisRequesterTests(TestCase):
@@ -82,14 +84,18 @@ class RedisRequesterTests(TestCase):
         self.redis_model = FakeRedisModel()
         self.redis_model.sets["txscale.test-service"] = {"txscale.test-service.chan1"}
         self.clock = Clock()
+        self.total_timeout = 5
+        self.after_request_timeout = 1
 
-    def connect(self):
+    def connect(self, auto_connect=True):
         redis_client_stuff = namedtuple("RedisClientStuff", ["requester", "endpoint"])
-        endpoint = FakeEndpoint()
+        endpoint = FakeEndpoint(auto_connect=auto_connect)
         redis_factory = lambda: FakeRedis(self.redis_model)
         redis_subscriber_factory = lambda: FakeRedisSubscriber(self.redis_model)
         requester = RedisRequester(
             "test-service", endpoint, self.clock,
+            total_timeout=self.total_timeout,
+            after_request_timeout=self.after_request_timeout,
             _redis=redis_factory, _redis_subscriber=redis_subscriber_factory)
 
         return redis_client_stuff(requester=requester, endpoint=endpoint)
@@ -99,9 +105,6 @@ class RedisRequesterTests(TestCase):
             request.response_channel, request.message_id + response)
 
     def _getPublishedRequests(self, channel="txscale.test-service.chan1"):
-        """
-        Get 
-        """
         return map(splitRequest, self.redis_model.channels[channel])
 
     def test_request(self):
@@ -160,8 +163,59 @@ class RedisRequesterTests(TestCase):
         self.assertEqual(request1.response_channel, client1.requester.client_channel)
         self.assertEqual(request2.response_channel, client2.requester.client_channel)
 
+    def test_after_request_timeout(self):
+        """
+        When an amount of time equivalent to the C{after_request_timeout} has passed after the
+        request was delivered, a L{TimeOutError} will be raised.
+        """
+        client = self.connect()
+        deferred = client.requester.request("foo")
+        self.clock.advance(self.after_request_timeout)
+        failure = self.failureResultOf(deferred)
+        failure.trap(TimeOutError)
+        self.assertEqual(failure.value.timeout_type, "after_request_timeout")
+        self.assertEqual(failure.value.timeout_value, self.after_request_timeout)
+
+    def test_after_request_timeout_ignored_response(self):
+        """
+        After the L{TimeOutError} for the C{after_request_timeout} has been raised, if the request
+        gets a real response, it will be ignored.
+        """
+        client = self.connect()
+        deferred = client.requester.request("foo")
+        [request] = self._getPublishedRequests()
+        self.clock.advance(self.after_request_timeout)
+        failure = self.failureResultOf(deferred)
+        failure.trap(TimeOutError)
+        self._respond(client, request, "result")
+        # XXX I don't have a good way to test for log output.
+        # I'll figure it out when I have a structured logging system in place.
+
+    def test_requests_queued_while_disconnected(self):
+        """
+        Requests made while the client isn't currently connected to the command protocol will be
+        sent when the command protocol's connection is established.
+        """
+        client = self.connect(auto_connect=False)
+        client.requester.request("foo")
+        self.assertEqual(len(self._getPublishedRequests()), 0)
+        # XXX also wait for the subscription protocol to be established!
+        client.endpoint.protos["command"].connectionMade()
+        [request] = self._getPublishedRequests()
+        self.assertEqual(request.data, "foo")
+
+    def test_total_request_timeout(self):
+        """
+        A request will time out while queued if the C{total_request_timeout} is passed.
+        """
+        client = self.connect(auto_connect=False)
+        deferred = client.requester.request("foo")
+        self.assertEqual(len(self._getPublishedRequests()), 0)
+        self.clock.advance(self.total_timeout)
+        failure = self.failureResultOf(deferred)
+        failure.trap(TimeOutError)
+
     # - option to turn NoServiceError into a queue?
-    # - queuing messages when not connected
     # - race conditions with one connection made and the other pending
     # - and swapped
     # - multiple clients don't interfere with each other

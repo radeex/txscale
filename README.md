@@ -55,5 +55,13 @@ Things I want to do before I release a backwards-compatible, "supported" version
 * servers call pauseProducing if incoming requests exceeds configured concurrency
   (or the Tubes equiv)
 * number-of-requests has a hard limit on the client
+* figure out and implement thorough logging. Logging is really important!
+  * There should be options exposed by the library to specify what kind of stuff is logged
+  * Log format should be very concise and descriptive.
+  * All log data should be structured.
+    * context - the name of the txScale subcomponent, like "redis" or "json-rpc"
+    * event_name - something like "message_received" or "backlog_exceeded" -- unique when
+      combined with the context
+    * per-event additional key/value pairs
 * some consideration for centralized log management (hopefully, just integrating with an existing
-  open source log aggregation system)
+  open source structured log aggregation system)
