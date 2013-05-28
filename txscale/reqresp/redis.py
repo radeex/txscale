@@ -456,7 +456,6 @@ class _ClientRequest(object):
         self.result_deferred = Deferred()
         self.channel = None
         self.message = message
-        self.after_request_timeout = None
         self._after_request_timeout_call = None
         self.total_timeout = total_timeout
         self._total_timeout_call = self.clock.callLater(
@@ -467,9 +466,8 @@ class _ClientRequest(object):
         self.channel = channel
 
     def startTimeOut(self, timeout):
-        self.after_request_timeout = timeout
-        self._call = self.clock.callLater(
-            timeout, self._timedOut, "after_request_timeout", self.after_request_timeout)
+        self._after_request_timeout_call = self.clock.callLater(
+            timeout, self._timedOut, "after_request_timeout", timeout)
 
     def _timedOut(self, timeout_type, timeout_value):
         self.result_deferred.errback(TimeOutError(timeout_type, timeout_value, self))

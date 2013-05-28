@@ -191,6 +191,18 @@ class RedisRequesterTests(TestCase):
         # XXX I don't have a good way to test for log output.
         # I'll figure it out when I have a structured logging system in place.
 
+    def test_after_request_timeout_call_canceled(self):
+        """
+        The after-request timeout does not cause a L{TimeOutError} if the result has been received.
+        """
+        client = self.connect()
+        deferred = client.requester.request("foo")
+        [request] = self._getPublishedRequests()
+        self._respond(client, request, "RESULT")
+        self.assertEqual(self.successResultOf(deferred), "RESULT")
+        # The following line would raise AlreadyCalledError if the timeout were still active.
+        self.clock.advance(self.after_request_timeout)
+
     def test_requests_queued_while_disconnected(self):
         """
         Requests made while the client isn't currently connected to the command protocol will be
