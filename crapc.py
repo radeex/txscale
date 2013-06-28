@@ -4,7 +4,7 @@ from twisted.internet import reactor
 from twisted.internet.endpoints import TCP4ClientEndpoint
 from twisted.python import log
 
-from txscale.reqresp.redis import RedisRequester, ServiceGracefullyDisappearedError, TimeOutError
+from txscale.reqresp.redis import RedisRequester, TimeOutError
 from txscale.rpc.jsonrpc import JSONRPCClient
 
 
@@ -34,7 +34,7 @@ def doit():
 
 
 def gotError(failure):
-    failure.trap(ServiceGracefullyDisappearedError, TimeOutError)
+    failure.trap(TimeOutError)
     print failure.getErrorMessage()
     print "ignoring error. continuing."
     return doit()

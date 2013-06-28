@@ -21,46 +21,18 @@ class FakeRedisModel(object):
         self.sets = defaultdict(set)
         self.channels = defaultdict(list)
 
-    def publish(self, channel, message):
-        self.channels[channel].append(message)
-
 
 class FakeRedis(object):
     """A fake Redis protocol."""
 
-    name = "command"
-
     def __init__(self, model):
         self.model = model
 
-    def publish(self, channel, message):
-        self.model.publish(channel, message)
-
-    def srem(self, set_name, element):
-        self.model.sets[set_name].discard(element)
-        return succeed(None)
-
-    def sadd(self, set_name, element):
-        self.model.sets[set_name].add(element)
-        return succeed(None)
-
-    def smembers(self, set_name):
-        return succeed(self.model.sets[set_name])
-
-
-class FakeRedisSubscriber(object):
-    """A fake Redis subscriber protocol."""
-
-    name = "subscription"
-
-    def __init__(self, model):
-        self.model = model
-
-    def subscribe(self, *channels):
+    def bpop(self, list_names, timeout):
         pass
 
-    def getResponse(self):
-        return succeed(None)
+    def push(self, key, value, tail=False):
+        pass
 
 
 class FakeEndpoint(object):
@@ -71,10 +43,9 @@ class FakeEndpoint(object):
         self.auto_connect = auto_connect
 
     def connect(self, factory):
-        protocol = factory.buildProtocol(None)
-        self.protos[protocol.name] = protocol
+        self.protocol = factory.buildProtocol(None)
         if self.auto_connect:
-            protocol.connectionMade()
+            self.protocol.connectionMade()
 
 
 class RedisRequesterTests(TestCase):
@@ -82,7 +53,6 @@ class RedisRequesterTests(TestCase):
 
     def setUp(self):
         self.redis_model = FakeRedisModel()
-        self.redis_model.sets["txscale.test-service"] = {"txscale.test-service.chan1"}
         self.clock = Clock()
         self.total_timeout = 5
         self.after_request_timeout = 1
@@ -91,18 +61,16 @@ class RedisRequesterTests(TestCase):
         redis_client_stuff = namedtuple("RedisClientStuff", ["requester", "endpoint"])
         endpoint = FakeEndpoint(auto_connect=auto_connect)
         redis_factory = lambda: FakeRedis(self.redis_model)
-        redis_subscriber_factory = lambda: FakeRedisSubscriber(self.redis_model)
         requester = RedisRequester(
             "test-service", endpoint, self.clock,
             total_timeout=self.total_timeout,
             after_request_timeout=self.after_request_timeout,
-            _redis=redis_factory, _redis_subscriber=redis_subscriber_factory)
+            _redis=redis_factory)
 
         return redis_client_stuff(requester=requester, endpoint=endpoint)
 
     def _respond(self, client_stuff, request, response):
-        client_stuff.endpoint.protos["subscription"].messageReceived(
-            request.response_channel, request.message_id + response)
+        1 / 0
 
     def _getPublishedRequests(self, channel="txscale.test-service.chan1"):
         return map(splitRequest, self.redis_model.channels[channel])

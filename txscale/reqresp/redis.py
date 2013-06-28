@@ -1,80 +1,56 @@
 """
 Redis request/response support.
 
+TODO! Use RPOPLPUSH to handle crashing endpoints! http://redis.io/commands/rpoplpush
+
 Pros:
  - you can deploy it on Redis
 
 Cons:
- - Unreliable:
-   - If a client gets temporarily disconnected after it sends a request, it might miss the
-     response.
-   - Servers might pull a message off the stack and then not respond to it, even in graceful
-     shutdown. But at least the client will know that it wasn't processed: see
-     L{ServiceGracefullyDisappearedError}.
 
-Redis pubsub really really simple, and good at what it does, but message routing needs more than
-pubsub.  This means we have to add a significant amount of bookkeeping on top of the basic pubsub
-functionality in order to get a reliable, scalable, dynamic message routing system.
 
-First, Redis can't do the routing for us.  Pubsub is purely fan-out, of course, but we want only
-one service instance to get any given message.  So we have a system of multiple channels, one for
-each service instance, and the client must choose a random one for each request so as to distribute
-load evenly.
+Design -- Responder:
 
-There's not even a way, in Redis, to list channels currently subscribed, so we have to create
-another mechanism to allow clients to discover which channels for a given service instance are
-available.  So we make the servers maintain a SET in Redis, name "txscale.<name>", containing the
-names of each channel a service instance is listening on.
+The responder makes two connections to Redis. One is the "listening" connection and the other is
+the "responding" connection.
 
-To make the client's job easier, we also have the services publish a message to a special control
-channel named "txscale.<name>.service-management" every time they are started or stopped, so that
-the client needn't continually poll the "txscale.<name>" set to discover when services instances
-are started or stopped.
+The "listening" connection calls BLPOP on a list named after the service. When an item is returned,
+the responder handles the message asynchronously and calls BLPOP again, immediately (with
+a configurable maximum concurrency!).
 
-Every service process maintains two connections to the redis server, one for subscribing to
-requests and another for publishing responses.
+The list that the responder calls BLPOP on is shared between multiple responders potentially
+running on multiple hosts.
 
-Clients also must maintain two connections to the redis server, one for publishing requests and
-another for subscribing to responses.
+When the asynchronous handling of the message is complete, the "responding" connection is told
+to PUSH the result onto a list named by the requester (that only that requester is listening on).
 
-Clients subscribe on channels named txscale-client.<name>.<id>.  When a client sends a request to a
-server, it includes its client-specific name and a random message-ID in the request, and the server
-will publish the result on that response-channel with the original message-ID.
 
-The service instances implement a graceful shutdown by waiting for all outstanding requests to be
-completed and then shutting down.
+Design -- Requester:
 
-Extra consideration must be given in the management of the txscale.<name> set of request channels,
-specifically for handling the case of a service instance dying without graceful shutdown.  We
-mustn't allow the clients to continue attempting to send messages to the unresponsive service.  So
-in the event that a client simply receives no response from the server in the alloted time, it
-will...  XXX send a "ping" message with a 10-second timeout?  and if that times out, remove the
-service's channel from the set and broadcast a removal message?
+The requester makes two connections to Redis. One is the "requesting" connection and the other
+is the "response receiving" connection.
+
+The "requesting" connection is used to PUSH a request onto a list named after the service. This is
+done on demand, whenever the requester is told to send a request.
+
+The "response receiving" connection is used to call BLPOP on a list named uniquely for the
+requester. Whenever an item is returned, it is dispatched to the Deferred associated with the
+request that it matches. It must then immediately re-issue a BLPOP call to fetch any other messages
+that may come in.
 """
-
-import random
 
 from uuid import uuid4
 
 from zope.interface import implementer
 
 from twisted.python import log
-from twisted.python.failure import Failure
 from twisted.internet.protocol import ReconnectingClientFactory
 from twisted.internet.defer import Deferred, gatherResults
 
-from txredis.protocol import Redis, RedisSubscriber
+from txredis.client import Redis
 
 from .interfaces import IResponder, IRequester
 from .messages import splitRequest, splitResponse, generateRequest, generateResponse
-
-
-class NoServiceError(Exception):
-    """No service instances are listening."""
-    def __init__(self, service_name):
-        self.service_name = service_name
-        super(NoServiceError, self).__init__(
-            "No services are listening on txscale.%s." % (service_name,))
 
 
 class TimeOutError(Exception):
@@ -88,116 +64,87 @@ class TimeOutError(Exception):
             "Request reached %s of %s: %r" % (timeout_type, timeout_value, request))
 
 
-class ServiceGracefullyDisappearedError(Exception):
+class _WatchedConnection(object):
     """
-    A service (instance) disappeared while waiting for a response.
+    Ensures that a protocol remains connected to an endpoint.
 
-    This is raised when a service has gracefully shut down and sent the client a message indicating
-    that it has done so.  Given that services must complete processing of all received messages
-    before broadcasting the message indicating it has shut down, that means the service must not
-    have received the request in the first place.  Thus, retrying a request in the case of this
-    exception is reasonable.
+    Calls the the passed-in callback when a new connection is made.
     """
-    def __init__(self, request):
-        self.request = request
-        super(ServiceGracefullyDisappearedError, self).__init__(
-            "Service disappeared while waiting for response to request %r" % (self.request))
+    def __init__(self, endpoint, protocol_class, connection_callback=None):
+        self.connection = None
 
+        self._protocol_class = protocol_class
+        self._connection_callback = connection_callback
 
-def watchProtocol(protocol, connectionMade, connectionLost):
-    """
-    Hook into a Protocol's connectionLost and connectionMade to invoke callbacks.
-    """
-    protocol.connectionMade = lambda: connectionMade(protocol)
-    protocol.connectionLost = lambda reason: connectionLost(protocol)
-    return protocol
+        sf = ReconnectingClientFactory()
+        sf.protocol = lambda: self._buildProtocol()
+        endpoint.connect(sf)
 
+    def _buildProtocol(self):
+        protocol = self._protocol_class()
+        protocol.connectionMade = lambda: self._saveConnection(protocol)
+        protocol.connectionLost = lambda reason: self._removeConnection(protocol)
+        return protocol
 
-def unregisterServiceInstance(publishing_protocol, service_name, channel):
-    print "unregistering service channel %s" % (channel,)
-    management_channel = "txscale.%s.service-management" % (service_name,)
-    d1 = publishing_protocol.publish(management_channel, "GONE " + channel)
-    d2 = publishing_protocol.srem("txscale." + service_name, channel)
-    return gatherResults([d1, d2])
+    def _saveConnection(self, protocol):
+        log.msg("connection-made-to-something")
+        self.connection = protocol
+        if self._connection_callback is not None:
+            self._connection_callback()
+
+    def _removeConnection(self, protocol):
+        self.connection = None
 
 
 @implementer(IResponder)
 class RedisResponder(object):
     """The Redis responder."""
 
-    def __init__(self, redis_endpoint,
-                 _redis_subscriber=RedisSubscriber,
-                 _redis=Redis):
+    def __init__(self, redis_endpoint, _redis=Redis):
         """
         @param redis_endpoint: A L{IStreamClientEndpoint} pointing at a Redis server.
         """
         self.redis_endpoint = redis_endpoint
         self._response_queue = []
-        self._subscription_protocol = None
-        self._response_protocol = None
         self.uuid = uuid4().hex
         self._waiting_results = set()  # deferreds that we're still waiting to fire
-        self._redis_subscriber = _redis_subscriber
         self._redis = _redis
 
     def listen(self, name, handler):
         """
-        Allocate a unique ID, subscribe to channel txscale.<name>.<id>, and dispatch
-        messages received to the handler.
         """
-        # XXX must support multiple calls to listen() with different names
+        # TODO:
+        # - support multiple calls to listen() with different names/handlers
+        #   (and only use one pair of connections for multiple listeners)
+        # - error reporting?
+        # - kick off the listener XXX
         self.name = name
-        self.channel = "txscale." + self.name + "." + self.uuid
-        self.service_management_channel = "txscale." + name + ".service-management"
-        # XXX error reporting
-        sf = ReconnectingClientFactory()
-        sf.protocol = lambda: watchProtocol(self._redis_subscriber(),
-                                            self._saveSubscriptionConnection,
-                                            self._removeSubscriptionConnection)
-        self.redis_endpoint.connect(sf)
-        pf = ReconnectingClientFactory()
-        pf.protocol = lambda: watchProtocol(self._redis(),
-                                            self._savePublishingConnection,
-                                            self._removePublishingConnection)
-        self.redis_endpoint.connect(pf)
         self.handler = handler
+        self.running = True
+        self._responding_connection = _WatchedConnection(
+            self.redis_endpoint,
+            self._redis,
+            connection_callback=self._sendQueuedResponses)
+        self._listening_connection = _WatchedConnection(
+            self.redis_endpoint,
+            self._redis,
+            connection_callback=self._listenLoop)
 
-    def _saveSubscriptionConnection(self, protocol):
+    def _listenLoop(self):
+        if self.running:
+            if self._listening_connection.connection is None:
+                log.msg("request-listener-lost-connection")
+                return
+            r = self._listening_connection.connection.bpop(["txscale." + self.name], timeout=0)
+            r.addCallback(self._messageReceived)
+
+    def _sendQueuedResponses(self):
         # XXX log
-        print "subscribing to", self.channel
-        protocol.messageReceived = self._messageReceived
-        protocol.subscribe(self.channel)
-        self._subscription_protocol = protocol
+        for d, response_list_name, data in self._response_queue:
+            d.chainDeferred(self._responding_connection.connection.push(response_list_name, data))
 
-    def _savePublishingConnection(self, protocol):
-        # XXX log
-        self._response_protocol = protocol
-        self._registerServer()
-        protocol.publish(self.service_management_channel, "NEW " + self.channel)
-
-        for d, response_channel, data in self._response_queue:
-            d.chainDeferred(self._response_protocol.publish(response_channel, data))
-
-    def _removeSubscriptionConnection(self, protocol):
-        # XXX log
-        self._subscription_protocol = None
-
-    def _removePublishingConnection(self, protocol):
-        # XXX log
-        self._response_protocol = None
-
-    def _registerServer(self):
-        """
-        Save this server's UUID in the txscale.<name> set, so clients know what listeners they can
-        talk to.
-        """
-        self._response_protocol.sadd("txscale." + self.name, self.channel)
-
-    def _messageReceived(self, channel, data):
-        if data.startswith("ping "):
-            response_channel = data.split(" ", 1)[1]
-            self._response_protocol.publish(response_channel, "pong %s" % (self.channel,))
-            return
+    def _messageReceived(self, bpop_result):
+        data = bpop_result[1]
         try:
             request = splitRequest(data)
         except:
@@ -208,88 +155,55 @@ class RedisResponder(object):
         self._waiting_results.add(d)
         d.addErrback(log.err) # XXX yessss
         d.addCallback(lambda ignored: self._waiting_results.remove(d))
+        self._listenLoop()
 
-    def _sendResponse(self, payload, message_id, response_channel):
+    def _sendResponse(self, payload, message_id, response_list_name):
         data = generateResponse(message_id, payload)
-        if self._response_protocol is not None:
-            return self._response_protocol.publish(response_channel, data)
+        if self._responding_connection.connection is not None:
+            self._responding_connection.connection.push(response_list_name, data)
         else:
-            return self._queueResponse(response_channel, data)
+            return self._queueResponse(response_list_name, data)
 
-    def _queueResponse(self, response_channel, data):
+    def _queueResponse(self, response_list_name, data):
         d = Deferred()
-        self._response_queue.append((d, response_channel, data))
+        self._response_queue.append((d, response_list_name, data))
         return d
 
     def stop(self):
+        self.running = False # XXX Do something with this.
         print "waiting for all results to be sent", self._waiting_results
         d = gatherResults(self._waiting_results)
         d.addErrback(log.err)
-        d.addCallback(lambda ignored: unregisterServiceInstance(self._response_protocol,
-                                                                self.name, self.channel))
         return d
-
-
-"""
-WTF, how come this happens sometimes?
-
-2013-05-15 07:01:26+0000 [_Publisher,client] Stopping factory <twisted.internet.protocol.ReconnectingClientFactory instance at 0x300ea70>
-2013-05-15 07:01:26+0000 [_Publisher,client] Unhandled Error
-    Traceback (most recent call last):
-      File "/home/radix/Projects/Twisted/trunk/twisted/python/log.py", line 88, in callWithLogger
-        return callWithContext({"system": lp}, func, *args, **kw)
-      File "/home/radix/Projects/Twisted/trunk/twisted/python/log.py", line 73, in callWithContext
-        return context.call({ILogContext: newCtx}, func, *args, **kw)
-      File "/home/radix/Projects/Twisted/trunk/twisted/python/context.py", line 118, in callWithContext
-        return self.currentContext().callWithContext(ctx, func, *args, **kw)
-      File "/home/radix/Projects/Twisted/trunk/twisted/python/context.py", line 81, in callWithContext
-        return func(*args,**kw)
-    --- <exception caught here> ---
-      File "/home/radix/Projects/Twisted/trunk/twisted/internet/posixbase.py", line 619, in _doReadOrWrite
-        why = selectable.doWrite()
-      File "/home/radix/Projects/Twisted/trunk/twisted/internet/abstract.py", line 251, in doWrite
-        l = self.writeSomeData(self.dataBuffer)
-      File "/home/radix/Projects/Twisted/trunk/twisted/internet/tcp.py", line 247, in writeSomeData
-        return untilConcludes(self.socket.send, limitedData)
-    exceptions.AttributeError: 'Client' object has no attribute 'socket'
-"""
 
 
 @implementer(IRequester)
 class RedisRequester(object):
 
-    def __init__(self, service_name, redis_endpoint, clock,  total_timeout=3.0,
-                 after_request_timeout=1.0, service_disappeared_timeout=10,
-                 _redis_subscriber=RedisSubscriber,
+    def __init__(self, service_name, redis_endpoint, clock, total_timeout=3.0,
+                 after_request_timeout=1.0,
                  _redis=Redis):
         """
         @type clock: L{IReactorTime}
         @param clock: Typically, C{twisted.internet.reactor}.
         @param service_name: The name of the service to which we will connect.
-        # @param total_timeout: The number of seconds to wait after L{request} is invoked to trigger
-        #     a timeout.
+        @param total_timeout: The number of seconds to wait after L{request} is invoked to trigger
+            a timeout.
         @param after_request_timeout: The number of seconds to wait after the request has actually
             been published to trigger a timeout.
         @param redis_endpoint: An endpoint pointing at a Redis server.
         @type redis_endpoint: L{IStreamClientEndpoint}.
         """
-        self._redis_subscriber = _redis_subscriber
         self._redis = _redis
         self.clock = clock
-        self.service_management_channel = "txscale." + service_name + ".service-management"
-        self.service_channels = set()
         self.redis_endpoint = redis_endpoint
         self.service_name = service_name
-        self.client_channel = "txscale-client.%s.%s" % (service_name, uuid4().hex)
+        self.request_list_name = "txscale.%s" % (service_name,)
+        self.response_list_name = "txscale-client.%s.%s" % (service_name, uuid4().hex)
         self._request_queue = []
-        self._request_protocol = None
-        self._response_protocol = None
         self._outstanding_requests = {}  # msg-id -> _ClientRequest
         self.total_timeout = total_timeout
         self.after_request_timeout = after_request_timeout
-        self.service_disappeared_timeout = service_disappeared_timeout
-        self.timeout_blacklist = set()
-        self._service_timeout_delayed_calls = {}
 
         self._connecting = False
 
@@ -297,44 +211,35 @@ class RedisRequester(object):
         if self._connecting:
             return
         self._connecting = True
-        # XXX error reporting
-        sf = ReconnectingClientFactory()
-        sf.protocol = lambda: watchProtocol(self._redis(),
-                                            self._savePublishingConnection,
-                                            self._removePublishingConnection)
-        self.redis_endpoint.connect(sf)
-        pf = ReconnectingClientFactory()
-        pf.protocol = lambda: watchProtocol(self._redis_subscriber(),
-                                            self._saveSubscriptionConnection,
-                                            self._removeSubscriptionConnection)
-        self.redis_endpoint.connect(pf)
+        self._request_connection = _WatchedConnection(
+            self.redis_endpoint,
+            self._redis,
+            connection_callback=self._sendQueuedRequests)
+        self._response_connection = _WatchedConnection(
+            self.redis_endpoint,
+            self._redis,
+            connection_callback=self._listenLoop)
 
-    def _getServiceChannel(self):
-        # XXX handle the case for no channels
-        # XXX blacklist shouldn't be a strict blacklist if there's nothing else to choose
-        # XXX queue messages if there's nothing available
-        channels = self.service_channels - self.timeout_blacklist
-        if not channels:
-            raise NoServiceError(self.service_name)
-        return random.sample(channels, 1)[0]
+    def _listenLoop(self):
+        if self._response_connection.connection is None:
+            log.msg("response-listener-lost-connection")
+            return
+        r = self._response_connection.connection.bpop(
+            [self.response_list_name],
+            timeout=0)
+        r.addCallback(self._messageReceived)
 
     def request(self, data):
         """
         Send a request.
-
-        There's a big problem, though.  Sometimes a server will disappear without responding.
-        Ideally, we'll get a control message on the service_management_channel that tells us the
-        server was gone, so if we get one of those about for any channels that we know we're
-        waiting for a response on, we should just call that one a loss and errback that Deferred.
-
-        Sometimes, though, we won't even get one of those (the server's cable was unplugged).
         """
         self._ensureConnection()
-        message_id, message = generateRequest(self.client_channel, data)
-        request = _ClientRequest(self.clock, message_id, message, self.total_timeout)
+        message_id, message = generateRequest(self.response_list_name, data)
+        request = _ClientRequest(self.clock, self.service_name, message_id, message,
+                                 self.total_timeout)
         self._outstanding_requests[message_id] = request
-        if self._request_protocol is not None:
-            self._publishConnected(request)
+        if self._request_connection.connection is not None:
+            self._sendRequest(request)
         else:
             self._queueRequest(request)
 
@@ -342,128 +247,49 @@ class RedisRequester(object):
             del self._outstanding_requests[message_id]
             return result
         request.result_deferred.addBoth(_cleanUpRequest)
-
-        def _checkTimeOut(failure):
-            failure.trap(TimeOutError)
-            self._checkService(request.channel)
-            return failure
-        request.result_deferred.addErrback(_checkTimeOut)
         return request.result_deferred
 
-    def _checkService(self, channel):
-        """Make sure the service instance at the given channel is still there."""
-        # hmm, you know it'd be cool if we also sent a "lagging" command over the service-
-        # management channel to allow other clients and servers know that a service instance is
-        # timing out on the application level, allowing them to weight it lower to give it a chance
-        # to recover.
-        if channel in self._service_timeout_delayed_calls:
-            print "already sent ping"
-            return
-        if self._request_protocol is not None:
-            print "pinging service at channel %s to determine if it's still there" % (channel,)
-            self._request_protocol.publish(channel, "ping %s" % (self.client_channel,))
-            delayed_call = self.clock.callLater(10, self._unregisterServiceInstance, channel)
-            self._service_timeout_delayed_calls[channel] = delayed_call
-            self.timeout_blacklist.add(channel)
-
-    def _unregisterServiceInstance(self, channel):
-        unregisterServiceInstance(self._request_protocol, self.service_name, channel)
-
-    def _publishConnected(self, request):
+    def _sendRequest(self, request):
         """
         Publish the message to the connected protocol, and start the C{after_request_timeout}
         ticking.
         """
-        try:
-            channel = self._getServiceChannel()
-        except:
-            request.fail(Failure())
-            return
-        request.setChannel(channel)
-        # XXX this should handle the case of _request_protocol being None
-        self._request_protocol.publish(channel, request.message)
+        self._request_connection.connection.push(
+            self.request_list_name, request.message, tail=True)
         request.startTimeOut(self.after_request_timeout)
 
     def _queueRequest(self, request):
         """Save the request to be sent when we have a connection to the Redis server."""
         self._request_queue.append(request)
 
-    def _savePublishingConnection(self, protocol):
-        # XXX We shouldn't consider this really ready for sending messages until the subscription
-        # connection is ALSO made (and subscribed). We may end up making a request before we can
-        # process its response and miss it.
-        self._request_protocol = protocol
-        d = self._request_protocol.smembers("txscale." + self.service_name)
-        d.addCallback(self._gotAllServiceChannels)
-
-    def _gotAllServiceChannels(self, channels):
-        self.service_channels = channels
+    def _sendQueuedRequests(self):
         for request in self._request_queue:
-            self._publishConnected(request)
+            self._sendRequest(request)
 
-    def _saveSubscriptionConnection(self, protocol):
-        def subscribed(r):
-            self._response_protocol = protocol
-        protocol.messageReceived = self._messageReceived
-        protocol.subscribe(self.client_channel, self.service_management_channel)
-        protocol.getResponse().addCallback(subscribed)  # XXX oh god testing
+    def _messageReceived(self, bpop_result):
+        data = bpop_result[1]
+        message_id, message = splitResponse(data)
+        if message_id not in self._outstanding_requests:
+            log.msg(
+                "Got unexpected response to message-id %r. Maybe the request timed out?",
+                message_id=message_id)
+        else:
+            self._outstanding_requests[message_id].succeed(message)
 
-    def _removePublishingConnection(self, protocol):
-        self._request_protocol = None
-
-    def _removeSubscriptionConnection(self, protocol):
-        # XXX log
-        self._response_protocol = None
-
-    def _messageReceived(self, channel, data):
-        if channel == self.service_management_channel:
-            print "control message!", data
-            command, channel = data.split()
-
-            if command == "NEW":
-                self.service_channels.add(channel)
-            elif command == "GONE":
-                self.service_channels.discard(channel)  # XXX test case when we don't even have that channel
-                print "checking for requests to discard in", self._outstanding_requests
-                for request in self._outstanding_requests.values():
-                    if request.channel == channel:
-                        print "found a request on that channel", channel
-                        request.fail(
-                            ServiceGracefullyDisappearedError(request))
-        elif channel == self.client_channel:
-            if data.startswith("pong "):
-                channel = data.split(" ", 1)[1]
-                self.timeout_blacklist.discard(channel)
-                if channel in self._service_timeout_delayed_calls:
-                    # XXX WE NEED TO REMOVE THIS CALL FROM THE DICT
-                    call = self._service_timeout_delayed_calls[channel]
-                    if call.active():
-                        call.cancel()
-                return
-            message_id, message = splitResponse(data)
-            if message_id not in self._outstanding_requests:
-                log.msg(
-                    "Got unexpected response to message-id %r. Maybe the request timed out?",
-                    message_id=message_id)
-            else:
-                self._outstanding_requests[message_id].succeed(message)
+        self._listenLoop()
 
 
 class _ClientRequest(object):
-    def __init__(self, clock, message_id, message, total_timeout):
+    def __init__(self, clock, service_name, message_id, message, total_timeout):
         self.clock = clock
         self.message_id = message_id
         self.result_deferred = Deferred()
-        self.channel = None
+        self.service_name = None
         self.message = message
         self._after_request_timeout_call = None
         self.total_timeout = total_timeout
         self._total_timeout_call = self.clock.callLater(
             self.total_timeout, self._timedOut, "total_timeout", total_timeout)
-
-    def setChannel(self, channel):
-        """Record the channel on which this request is being sent."""
-        self.channel = channel
 
     def startTimeOut(self, timeout):
         self._after_request_timeout_call = self.clock.callLater(
@@ -486,7 +312,7 @@ class _ClientRequest(object):
         self.result_deferred.errback(failure)
 
     def __repr__(self):
-        return "<_ClientRequest message_id=%r channel=%s>" % (self.message_id, self.channel)
+        return "<_ClientRequest message_id=%r service=%s>" % (self.message_id, self.service_name)
 
     def __str__(self):
         return repr(self)
