@@ -3,6 +3,8 @@ Redis request/response support.
 
 TODO! Use RPOPLPUSH to handle crashing endpoints! http://redis.io/commands/rpoplpush
 
+TODO! Make sure we don't push into "dead" queues! maybe RPOPLPUSH is good enough for that?
+
 Pros:
  - you can deploy it on Redis
 
@@ -44,13 +46,14 @@ from uuid import uuid4
 from zope.interface import implementer
 
 from twisted.python import log
-from twisted.internet.protocol import ReconnectingClientFactory
 from twisted.internet.defer import Deferred, gatherResults
 
 from txredis.client import Redis
 
 from .interfaces import IResponder, IRequester
 from .messages import splitRequest, splitResponse, generateRequest, generateResponse
+from ..lib.queuedconnection import QueuedConnection
+from ..lib.watchedconnection import WatchedConnection
 
 
 class TimeOutError(Exception):
@@ -64,36 +67,24 @@ class TimeOutError(Exception):
             "Request reached %s of %s: %r" % (timeout_type, timeout_value, request))
 
 
-class _WatchedConnection(object):
+class RedisListener(object):
     """
-    Ensures that a protocol remains connected to an endpoint.
-
-    Calls the the passed-in callback when a new connection is made.
+    blpops items off a list and dispatches to a handler, allowing concurrency up to a configured
+    maximum.
     """
-    def __init__(self, endpoint, protocol_class, connection_callback=None):
-        self.connection = None
+    def __init__(self, endpoint, protocol_class, list_name, handler):
+        self.list_name = list_name
+        self.connection = WatchedConnection(
+            endpoint, protocol_class, connection_callback=self._listenLoop)
 
-        self._protocol_class = protocol_class
-        self._connection_callback = connection_callback
+    def _listenLoop(self):
+        while self.connection.connection is not None:
+            r = self.connection.connection.bpop([list_name], timeout=0)
+            r.addCallback(self.handler)
+            r.addErrback(log.err, "redis-listener-error")
 
-        sf = ReconnectingClientFactory()
-        sf.protocol = lambda: self._buildProtocol()
-        endpoint.connect(sf)
+        log.msg("redis-listener-lost-connection")
 
-    def _buildProtocol(self):
-        protocol = self._protocol_class()
-        protocol.connectionMade = lambda: self._saveConnection(protocol)
-        protocol.connectionLost = lambda reason: self._removeConnection(protocol)
-        return protocol
-
-    def _saveConnection(self, protocol):
-        log.msg("connection-made-to-something")
-        self.connection = protocol
-        if self._connection_callback is not None:
-            self._connection_callback()
-
-    def _removeConnection(self, protocol):
-        self.connection = None
 
 
 @implementer(IResponder)
@@ -121,11 +112,10 @@ class RedisResponder(object):
         self.name = name
         self.handler = handler
         self.running = True
-        self._responding_connection = _WatchedConnection(
+        self._responding_connection = QueuedConnection(
             self.redis_endpoint,
-            self._redis,
-            connection_callback=self._sendQueuedResponses)
-        self._listening_connection = _WatchedConnection(
+            self._redis)
+        self._listening_connection = WatchedConnection(
             self.redis_endpoint,
             self._redis,
             connection_callback=self._listenLoop)
@@ -137,11 +127,6 @@ class RedisResponder(object):
                 return
             r = self._listening_connection.connection.bpop(["txscale." + self.name], timeout=0)
             r.addCallback(self._messageReceived)
-
-    def _sendQueuedResponses(self):
-        # XXX log
-        for d, response_list_name, data in self._response_queue:
-            d.chainDeferred(self._responding_connection.connection.push(response_list_name, data))
 
     def _messageReceived(self, bpop_result):
         data = bpop_result[1]
@@ -159,15 +144,7 @@ class RedisResponder(object):
 
     def _sendResponse(self, payload, message_id, response_list_name):
         data = generateResponse(message_id, payload)
-        if self._responding_connection.connection is not None:
-            self._responding_connection.connection.push(response_list_name, data)
-        else:
-            return self._queueResponse(response_list_name, data)
-
-    def _queueResponse(self, response_list_name, data):
-        d = Deferred()
-        self._response_queue.append((d, response_list_name, data))
-        return d
+        self._responding_connection.do("push", response_list_name, data)
 
     def stop(self):
         self.running = False # XXX Do something with this.
@@ -181,7 +158,6 @@ class RedisResponder(object):
 class RedisRequester(object):
 
     def __init__(self, service_name, redis_endpoint, clock, total_timeout=3.0,
-                 after_request_timeout=1.0,
                  _redis=Redis):
         """
         @type clock: L{IReactorTime}
@@ -189,8 +165,6 @@ class RedisRequester(object):
         @param service_name: The name of the service to which we will connect.
         @param total_timeout: The number of seconds to wait after L{request} is invoked to trigger
             a timeout.
-        @param after_request_timeout: The number of seconds to wait after the request has actually
-            been published to trigger a timeout.
         @param redis_endpoint: An endpoint pointing at a Redis server.
         @type redis_endpoint: L{IStreamClientEndpoint}.
         """
@@ -203,19 +177,11 @@ class RedisRequester(object):
         self._request_queue = []
         self._outstanding_requests = {}  # msg-id -> _ClientRequest
         self.total_timeout = total_timeout
-        self.after_request_timeout = after_request_timeout
 
-        self._connecting = False
-
-    def _ensureConnection(self):
-        if self._connecting:
-            return
-        self._connecting = True
-        self._request_connection = _WatchedConnection(
+        self._request_connection = QueuedConnection(
             self.redis_endpoint,
-            self._redis,
-            connection_callback=self._sendQueuedRequests)
-        self._response_connection = _WatchedConnection(
+            self._redis)
+        self._response_connection = WatchedConnection(
             self.redis_endpoint,
             self._redis,
             connection_callback=self._listenLoop)
@@ -233,15 +199,11 @@ class RedisRequester(object):
         """
         Send a request.
         """
-        self._ensureConnection()
         message_id, message = generateRequest(self.response_list_name, data)
         request = _ClientRequest(self.clock, self.service_name, message_id, message,
                                  self.total_timeout)
         self._outstanding_requests[message_id] = request
-        if self._request_connection.connection is not None:
-            self._sendRequest(request)
-        else:
-            self._queueRequest(request)
+        self._sendRequest(request)
 
         def _cleanUpRequest(result):
             del self._outstanding_requests[message_id]
@@ -251,28 +213,16 @@ class RedisRequester(object):
 
     def _sendRequest(self, request):
         """
-        Publish the message to the connected protocol, and start the C{after_request_timeout}
-        ticking.
+        Publish the message to the connected protocol.
         """
-        self._request_connection.connection.push(
-            self.request_list_name, request.message, tail=True)
-        request.startTimeOut(self.after_request_timeout)
-
-    def _queueRequest(self, request):
-        """Save the request to be sent when we have a connection to the Redis server."""
-        self._request_queue.append(request)
-
-    def _sendQueuedRequests(self):
-        for request in self._request_queue:
-            self._sendRequest(request)
+        self._request_connection.do("push",  self.request_list_name, request.message, tail=True)
 
     def _messageReceived(self, bpop_result):
         data = bpop_result[1]
         message_id, message = splitResponse(data)
         if message_id not in self._outstanding_requests:
-            log.msg(
-                "Got unexpected response to message-id %r. Maybe the request timed out?",
-                message_id=message_id)
+            log.msg("Got unexpected response to message-id %r. Maybe the request timed out?",
+                    message_id=message_id)
         else:
             self._outstanding_requests[message_id].succeed(message)
 
@@ -290,10 +240,6 @@ class _ClientRequest(object):
         self.total_timeout = total_timeout
         self._total_timeout_call = self.clock.callLater(
             self.total_timeout, self._timedOut, "total_timeout", total_timeout)
-
-    def startTimeOut(self, timeout):
-        self._after_request_timeout_call = self.clock.callLater(
-            timeout, self._timedOut, "after_request_timeout", timeout)
 
     def _timedOut(self, timeout_type, timeout_value):
         self.result_deferred.errback(TimeOutError(timeout_type, timeout_value, self))
