@@ -129,10 +129,12 @@ class RedisResponder(object):
 
     def listen(self, name, handler):
         """
+        Listen for incoming requests and dispatch them.
+
+        @param name: The name of the service to handle requests for. The name of the Redis list
+            which be watched for requests is txscale.{name}.
+        @param handler: The L{IRequestHandler} to dispatch requests to.
         """
-        # TODO:
-        # - only use one pair of connections for multiple listeners
-        #   actually I don't think that's possible with bpop. Only one bpop per connection.
         self._responding_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)

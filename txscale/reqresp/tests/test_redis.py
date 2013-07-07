@@ -7,9 +7,6 @@ from twisted.internet.defer import succeed
 from ..redis import RedisResponder, RedisRequester, NoServiceError, TimeOutError
 from ..messages import splitRequest
 
-# TODO:
-# restart redis while running craps and crapc
-
 
 class FakeRedisModel(object):
     """
