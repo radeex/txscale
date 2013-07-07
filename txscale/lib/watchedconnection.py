@@ -1,4 +1,6 @@
-from twisted.internet.protocol import ReconnectingClientFactory
+from twisted.internet import reactor
+from twisted.internet.task import deferLater
+from twisted.internet.protocol import ClientFactory
 from twisted.python import log
 
 
@@ -14,20 +16,40 @@ class WatchedConnection(object):
       watchedConnection.connection is not None (and if it is None, optionally "queue up" requests
       to make with it)
     - specify a C{connection_callback} that sends the "queued up" requests.
+
+    Note that if a protocol implements connectionLost, the original implementation won't be called
+    if this class is used.
     """
     def __init__(self, endpoint, protocol_class, connection_callback=None):
         self.connection = None
+        self.stopped = False
 
+        self.endpoint = endpoint
         self._protocol_class = protocol_class
         self._connection_callback = connection_callback
 
-        sf = ReconnectingClientFactory()
-        sf.protocol = lambda: self._buildProtocol()
-        endpoint.connect(sf)
+        self.factory = ClientFactory()
+        self.factory.protocol = self._buildProtocol
+        self._ensureConnection()
+
+    def _connect(self):
+        """
+        Keep trying to connect until a connection is made.
+        """
+        result = self.endpoint.connect(self.factory)
+        result.addErrback(lambda failure: deferLater(reactor, 0.5, self._connect))
+        return result
+
+    def _ensureConnection(self):
+        """
+        Connect and save the resulting protocol instance as C{self.connection}.
+        """
+        result = self._connect()
+        result.addCallback(self._saveConnection)
+        return result
 
     def _buildProtocol(self):
         protocol = self._protocol_class()
-        protocol.connectionMade = lambda: self._saveConnection(protocol)
         protocol.connectionLost = lambda reason: self._removeConnection(protocol)
         return protocol
 
@@ -39,3 +61,12 @@ class WatchedConnection(object):
 
     def _removeConnection(self, protocol):
         self.connection = None
+        self._ensureConnection()
+
+    def stop(self):
+        """
+        Disconnect and don't try to reconnect.
+        """
+        self.stopped = True
+        if self.connection is not None:
+            self.connection.transport.loseConnection()
