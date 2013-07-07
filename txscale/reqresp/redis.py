@@ -1,14 +1,16 @@
 """
 Redis request/response support.
 
-TODO! Use RPOPLPUSH to handle crashing endpoints! http://redis.io/commands/rpoplpush
 
-TODO! Make sure we don't push into "dead" queues! maybe RPOPLPUSH is good enough for that?
-
-Pros:
- - you can deploy it on Redis
-
-Cons:
+TODO:
+ - Use RPOPLPUSH to handle crashing endpoints! http://redis.io/commands/rpoplpush
+ - Make sure we don't push into "dead" queues! maybe RPOPLPUSH is good enough for that?
+ - The server has graceful shutdown, should the client as well?
+   (refuse to send more requests but handle the results to the existing ones?)
+   Maybe that should just be done at the application level.
+ - Cleanup of client response lists on client shutdown.
+   - Use RPUSHX instead of RPUSH for responses sent by the server so that we won't try to send
+     messages to clients that definitely aren't listening.
 
 
 Design -- Responder:
@@ -46,8 +48,7 @@ from uuid import uuid4
 from zope.interface import implementer
 
 from twisted.python import log
-from twisted.internet.defer import (Deferred, maybeDeferred, gatherResults, inlineCallbacks,
-                                    DeferredSemaphore)
+from twisted.internet.defer import Deferred, gatherResults
 from twisted.internet.task import cooperate
 
 from txredis.client import Redis
@@ -81,7 +82,14 @@ class RedisListener(object):
         self.connection = WatchedConnection(
             endpoint, protocol_class, connection_callback=self._listen)
 
+    def stop(self):
+        """
+        Stop listening and disconnect.
+        """
+        self.connection.stop()
+
     def _listen(self):
+        print "LISTENING"
         for i in range(self.concurrency):
             x = self._listenLoop()
             cooperate(x)
@@ -115,25 +123,21 @@ class RedisResponder(object):
         # TODO:
         # - support multiple calls to listen() with different names/handlers
         #   (and only use one pair of connections for multiple listeners)
-        # - error reporting?
-        # - kick off the listener XXX
-        self.name = name
-        self.handler = handler
-        self.running = True
         self._responding_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
+        request_callback = lambda bpop_result: self._messageReceived(bpop_result, handler)
         self._listener = RedisListener(
-            self.redis_endpoint, self._redis, "txscale." + self.name, self._messageReceived, 10)
+            self.redis_endpoint, self._redis, "txscale." + name, request_callback, 10)
 
-    def _messageReceived(self, bpop_result):
+    def _messageReceived(self, bpop_result, handler):
         data = bpop_result[1]
         try:
             request = splitRequest(data)
         except:
             print "ERROR PARSING REQUEST", repr(data)
             raise
-        d = self.handler.handle(request.data)  # XXX maybeDeferred?
+        d = handler.handle(request.data)  # XXX maybeDeferred?
         d.addCallback(self._sendResponse, request.message_id, request.response_channel)
         self._waiting_results.add(d)
         d.addErrback(log.err) # XXX yessss
@@ -145,7 +149,11 @@ class RedisResponder(object):
         self._responding_connection.do("push", response_list_name, data)
 
     def stop(self):
-        self.running = False # XXX Do something with this.
+        """
+        Immediately stop listening for new connections, and return a Deferred that will fire when
+        all outstanding requests have had their responses sent.
+        """
+        self._listener.stop()
         print "waiting for all results to be sent", self._waiting_results
         d = gatherResults(self._waiting_results)
         d.addErrback(log.err)
@@ -176,6 +184,9 @@ class RedisRequester(object):
         self._outstanding_requests = {}  # msg-id -> _ClientRequest
         self.total_timeout = total_timeout
 
+        # Don't forget, it's okay if the request connection gets established (and we even send
+        # requests) before the response listener is hooked up, because the response listener will
+        # just pull messages off the list whenever it's ready.
         self._request_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
@@ -208,7 +219,7 @@ class RedisRequester(object):
         data = bpop_result[1]
         message_id, message = splitResponse(data)
         if message_id not in self._outstanding_requests:
-            log.msg("Got unexpected response to message-id %r. Maybe the request timed out?",
+            log.msg("Got unexpected response. Maybe the request timed out?",
                     message_id=message_id)
         else:
             self._outstanding_requests[message_id].succeed(message)
