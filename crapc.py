@@ -10,7 +10,7 @@ from txscale.reqresp.redis import RedisRequester, TimeOutError
 from txscale.rpc.jsonrpc import JSONRPCClient
 
 
-SPAM = True
+SPAM = False
 
 
 redis_endpoint = TCP4ClientEndpoint(reactor, "localhost", 6379)
