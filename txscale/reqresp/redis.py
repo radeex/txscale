@@ -89,12 +89,22 @@ class RedisListener(object):
         self.connection.stop()
 
     def _listen(self):
-        print "LISTENING"
+        """
+        Concurrently run L{_listenLoop} a number of times as specified in C{self.concurrency}.
+        """
         for i in range(self.concurrency):
             x = self._listenLoop()
             cooperate(x)
 
     def _listenLoop(self):
+        """
+        Pull messages off the queue and dispatch them to a handler.
+        """
+        # This is a *little* bit weird, in some sense. we run bpop here, concurrently with bpops
+        # running in other calls to _listenLoop, even though the bpops aren't really concurrent
+        # on the redis connection (one bpop call blocks before another one can be sent).
+        # It doesn't really matter, though. Whoever bpops first will get the first message, and if
+        # there are no messages yet, they'll all effectively block.
         while self.connection.connection is not None:
             result = self.connection.connection.bpop([self.list_name], timeout=0)
             result.addCallback(self.handler)
@@ -121,8 +131,8 @@ class RedisResponder(object):
         """
         """
         # TODO:
-        # - support multiple calls to listen() with different names/handlers
-        #   (and only use one pair of connections for multiple listeners)
+        # - only use one pair of connections for multiple listeners
+        #   actually I don't think that's possible with bpop. Only one bpop per connection.
         self._responding_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
