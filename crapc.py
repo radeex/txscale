@@ -2,10 +2,15 @@ import time
 
 from twisted.internet import reactor
 from twisted.internet.endpoints import TCP4ClientEndpoint
+from twisted.internet.defer import inlineCallbacks
+from twisted.internet.task import LoopingCall, deferLater
 from twisted.python import log
 
 from txscale.reqresp.redis import RedisRequester, TimeOutError
 from txscale.rpc.jsonrpc import JSONRPCClient
+
+
+SPAM = True
 
 
 redis_endpoint = TCP4ClientEndpoint(reactor, "localhost", 6379)
@@ -25,7 +30,6 @@ def gotResponse(response):
         print "mark. %s rps" % (responses,)
         responses = 0
         mark = step
-    return doit()
 
 
 def doit():
@@ -40,7 +44,18 @@ def gotError(failure):
     return doit()
 
 mark = time.time()
-doit().addErrback(log.err)
+
+@inlineCallbacks
+def loopDoit():
+    while True:
+        result = doit().addErrback(log.err)
+        if SPAM:
+            yield deferLater(reactor, 0.0005, lambda: None)
+        else:
+            yield result
+
+loopDoit()
+
 
 if __name__ == '__main__':
     import sys

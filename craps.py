@@ -2,6 +2,7 @@ import time
 
 from twisted.internet import reactor
 from twisted.internet.endpoints import TCP4ClientEndpoint
+from twisted.internet.task import deferLater
 
 from txscale.reqresp.redis import RedisResponder
 from txscale.rpc.jsonrpc import JSONRequestHandler, MethodHandler
@@ -23,6 +24,7 @@ class EchoHandler(MethodHandler):
             self.requests = 0
         self.requests += 1
         return data
+        # return deferLater(reactor, 0.0005, lambda: data)
 
 redis_endpoint = TCP4ClientEndpoint(reactor, "localhost", 6379)
 responder = RedisResponder(redis_endpoint)

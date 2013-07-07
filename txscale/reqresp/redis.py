@@ -46,7 +46,9 @@ from uuid import uuid4
 from zope.interface import implementer
 
 from twisted.python import log
-from twisted.internet.defer import Deferred, gatherResults
+from twisted.internet.defer import (Deferred, maybeDeferred, gatherResults, inlineCallbacks,
+                                    DeferredSemaphore)
+from twisted.internet.task import cooperate
 
 from txredis.client import Redis
 
@@ -72,19 +74,22 @@ class RedisListener(object):
     blpops items off a list and dispatches to a handler, allowing concurrency up to a configured
     maximum.
     """
-    def __init__(self, endpoint, protocol_class, list_name, handler):
+    def __init__(self, endpoint, protocol_class, list_name, handler, concurrency):
         self.list_name = list_name
+        self.handler = handler
+        self.semaphore = DeferredSemaphore(concurrency)
         self.connection = WatchedConnection(
             endpoint, protocol_class, connection_callback=self._listenLoop)
 
+    @inlineCallbacks
     def _listenLoop(self):
         while self.connection.connection is not None:
-            r = self.connection.connection.bpop([list_name], timeout=0)
-            r.addCallback(self.handler)
-            r.addErrback(log.err, "redis-listener-error")
-
+            pop_result = yield self.connection.connection.bpop([self.list_name], timeout=0)
+            result = self.semaphore.acquire()
+            result.addCallback(lambda ignored: self.handler(pop_result))
+            result.addErrback(log.err, "redis-listener-error")
+            result.addCallback(lambda ignored: self.semaphore.release())
         log.msg("redis-listener-lost-connection")
-
 
 
 @implementer(IResponder)
@@ -115,18 +120,8 @@ class RedisResponder(object):
         self._responding_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
-        self._listening_connection = WatchedConnection(
-            self.redis_endpoint,
-            self._redis,
-            connection_callback=self._listenLoop)
-
-    def _listenLoop(self):
-        if self.running:
-            if self._listening_connection.connection is None:
-                log.msg("request-listener-lost-connection")
-                return
-            r = self._listening_connection.connection.bpop(["txscale." + self.name], timeout=0)
-            r.addCallback(self._messageReceived)
+        self._listener = RedisListener(
+            self.redis_endpoint, self._redis, "txscale." + self.name, self._messageReceived, 10)
 
     def _messageReceived(self, bpop_result):
         data = bpop_result[1]
@@ -140,7 +135,7 @@ class RedisResponder(object):
         self._waiting_results.add(d)
         d.addErrback(log.err) # XXX yessss
         d.addCallback(lambda ignored: self._waiting_results.remove(d))
-        self._listenLoop()
+        return d
 
     def _sendResponse(self, payload, message_id, response_list_name):
         data = generateResponse(message_id, payload)
@@ -181,19 +176,8 @@ class RedisRequester(object):
         self._request_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
-        self._response_connection = WatchedConnection(
-            self.redis_endpoint,
-            self._redis,
-            connection_callback=self._listenLoop)
-
-    def _listenLoop(self):
-        if self._response_connection.connection is None:
-            log.msg("response-listener-lost-connection")
-            return
-        r = self._response_connection.connection.bpop(
-            [self.response_list_name],
-            timeout=0)
-        r.addCallback(self._messageReceived)
+        self._response_listener = RedisListener(
+            self.redis_endpoint, self._redis, self.response_list_name, self._messageReceived, 10)
 
     def request(self, data):
         """
@@ -225,8 +209,6 @@ class RedisRequester(object):
                     message_id=message_id)
         else:
             self._outstanding_requests[message_id].succeed(message)
-
-        self._listenLoop()
 
 
 class _ClientRequest(object):
