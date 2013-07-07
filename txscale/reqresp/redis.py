@@ -77,18 +77,21 @@ class RedisListener(object):
     def __init__(self, endpoint, protocol_class, list_name, handler, concurrency):
         self.list_name = list_name
         self.handler = handler
-        self.semaphore = DeferredSemaphore(concurrency)
+        self.concurrency = concurrency
         self.connection = WatchedConnection(
-            endpoint, protocol_class, connection_callback=self._listenLoop)
+            endpoint, protocol_class, connection_callback=self._listen)
 
-    @inlineCallbacks
+    def _listen(self):
+        for i in range(self.concurrency):
+            x = self._listenLoop()
+            cooperate(x)
+
     def _listenLoop(self):
         while self.connection.connection is not None:
-            pop_result = yield self.connection.connection.bpop([self.list_name], timeout=0)
-            result = self.semaphore.acquire()
-            result.addCallback(lambda ignored: self.handler(pop_result))
+            result = self.connection.connection.bpop([self.list_name], timeout=0)
+            result.addCallback(self.handler)
             result.addErrback(log.err, "redis-listener-error")
-            result.addCallback(lambda ignored: self.semaphore.release())
+            yield result
         log.msg("redis-listener-lost-connection")
 
 
@@ -177,7 +180,7 @@ class RedisRequester(object):
             self.redis_endpoint,
             self._redis)
         self._response_listener = RedisListener(
-            self.redis_endpoint, self._redis, self.response_list_name, self._messageReceived, 10)
+            self.redis_endpoint, self._redis, self.response_list_name, self._messageReceived, 1)
 
     def request(self, data):
         """
