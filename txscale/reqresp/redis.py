@@ -3,14 +3,19 @@ Redis request/response support.
 
 
 TODO:
- - Use RPOPLPUSH to handle crashing endpoints! http://redis.io/commands/rpoplpush
- - Make sure we don't push into "dead" queues! maybe RPOPLPUSH is good enough for that?
+ - Use RPOPLPUSH to handle retries. http://redis.io/commands/rpoplpush
+ - Make sure we don't push into "dead" queues
+   - implement ack for client response receipt?
  - The server has graceful shutdown, should the client as well?
    (refuse to send more requests but handle the results to the existing ones?)
    Maybe that should just be done at the application level.
  - Cleanup of client response lists on client shutdown.
-   - Use RPUSHX instead of RPUSH for responses sent by the server so that we won't try to send
-     messages to clients that definitely aren't listening.
+   - I wanted to use RPUSHX, to avoid sending responses to dead clients (after
+     they delete the list manually on shutdown), but that won't work because
+     lists "don't exist" if they have no elements.
+   - so it seems the only thing to do would be to maintain a set of clients,
+     and ensure that the server only pushes to a client response list if that
+     client name appears in the set. (optimize with lua code!)
 
 
 Design -- Responder:
@@ -48,8 +53,7 @@ from uuid import uuid4
 from zope.interface import implementer
 
 from twisted.python import log
-from twisted.internet.defer import Deferred, gatherResults
-from twisted.internet.task import cooperate
+from twisted.internet.defer import Deferred, gatherResults, inlineCallbacks
 
 from txredis.client import Redis
 
@@ -57,6 +61,15 @@ from .interfaces import IResponder, IRequester
 from .messages import splitRequest, splitResponse, generateRequest, generateResponse
 from ..lib.queuedconnection import QueuedConnection
 from ..lib.watchedconnection import WatchedConnection
+
+
+PUSH_IF_REGISTERED = """
+    if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
+        return redis.call('RPUSH', ARGV[1], ARGV[2])
+    else
+        return false
+    end
+"""
 
 
 class TimeOutError(Exception):
@@ -93,9 +106,10 @@ class RedisListener(object):
         Concurrently run L{_listenLoop} a number of times as specified in C{self.concurrency}.
         """
         for i in range(self.concurrency):
-            x = self._listenLoop()
-            cooperate(x)
+            self._listenLoop()
+            
 
+    @inlineCallbacks
     def _listenLoop(self):
         """
         Pull messages off the queue and dispatch them to a handler.
