@@ -34,6 +34,7 @@ class QueuedConnection(object):
         If the underlying connection is not available, queue the method call and return a Deferred
         that will ultimately fire with the result of the underlying method.
         """
+        self.watched_connection.ensureWatchedConnection()
         if self.watched_connection.connection is not None:
             return self._do(method, args, kwargs)
         else:

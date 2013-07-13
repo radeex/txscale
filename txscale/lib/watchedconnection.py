@@ -30,7 +30,6 @@ class WatchedConnection(object):
 
         self.factory = ClientFactory()
         self.factory.protocol = self._buildProtocol
-        self._ensureConnection()
 
     def _connect(self):
         """
@@ -40,7 +39,7 @@ class WatchedConnection(object):
         result.addErrback(lambda failure: deferLater(reactor, 0.5, self._connect))
         return result
 
-    def _ensureConnection(self):
+    def ensureWatchedConnection(self):
         """
         Connect and save the resulting protocol instance as C{self.connection}.
         """
@@ -61,7 +60,7 @@ class WatchedConnection(object):
 
     def _removeConnection(self, protocol):
         self.connection = None
-        self._ensureConnection()
+        self.ensureWatchedConnection()
 
     def stop(self):
         """
