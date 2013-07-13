@@ -55,4 +55,4 @@ class QueuedConnection(object):
         while self._queue:
             item = self._queue.popleft()
             result = self._do(item.method, item.args, item.kwargs)
-            item.deferred.chainDeferred(result)
+            result.chainDeferred(item.deferred)

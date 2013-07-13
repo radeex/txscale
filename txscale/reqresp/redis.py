@@ -48,6 +48,7 @@ request that it matches. It must then immediately re-issue a BLPOP call to fetch
 that may come in.
 """
 
+from hashlib import sha1
 from uuid import uuid4
 
 from zope.interface import implementer
@@ -63,13 +64,15 @@ from ..lib.queuedconnection import QueuedConnection
 from ..lib.watchedconnection import WatchedConnection
 
 
-PUSH_IF_REGISTERED = """
+PUSH_IF_REGISTERED_SOURCE = """
     if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
         return redis.call('RPUSH', ARGV[1], ARGV[2])
     else
         return false
     end
 """
+
+PUSH_IF_REGISTERED = sha1(PUSH_IF_REGISTERED_SOURCE).hexdigest()
 
 
 class TimeOutError(Exception):
@@ -107,7 +110,6 @@ class RedisListener(object):
         """
         for i in range(self.concurrency):
             self._listenLoop()
-            
 
     @inlineCallbacks
     def _listenLoop(self):
@@ -152,9 +154,17 @@ class RedisResponder(object):
         self._responding_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
+        self._load_scripts()
         request_callback = lambda bpop_result: self._messageReceived(bpop_result, handler)
         self._listener = RedisListener(
             self.redis_endpoint, self._redis, "txscale." + name, request_callback, 10)
+
+    def _load_scripts(self):
+        x = self._responding_connection.do("script_load", PUSH_IF_REGISTERED_SOURCE)
+        def gotIt(r):
+            assert r == PUSH_IF_REGISTERED
+        x.addCallback(gotIt)
+        x.addErrback(log.err, "error-loading-scripts")
 
     def _messageReceived(self, bpop_result, handler):
         data = bpop_result[1]
@@ -172,7 +182,9 @@ class RedisResponder(object):
 
     def _sendResponse(self, payload, message_id, response_list_name):
         data = generateResponse(message_id, payload)
-        self._responding_connection.do("push", response_list_name, data)
+        self._responding_connection.do(
+            "evalsha", PUSH_IF_REGISTERED,
+            keys=["txscale.clients"], args=[response_list_name, data])
 
     def stop(self):
         """
@@ -180,7 +192,7 @@ class RedisResponder(object):
         all outstanding requests have had their responses sent.
         """
         self._listener.stop()
-        print "waiting for all results to be sent", self._waiting_results
+        log.msg("redis-responder-stopping")
         d = gatherResults(self._waiting_results)
         d.addErrback(log.err)
         return d
@@ -216,8 +228,15 @@ class RedisRequester(object):
         self._request_connection = QueuedConnection(
             self.redis_endpoint,
             self._redis)
+        self._register_client()
         self._response_listener = RedisListener(
             self.redis_endpoint, self._redis, self.response_list_name, self._messageReceived, 1)
+
+    def _register_client(self):
+        # XXX TODO: Figure out a way to clean up stale txscale.clients members if the client dies
+        # ungracefully.
+        x = self._request_connection.do("sadd", "txscale.clients", self.response_list_name)
+        x.addErrback(log.err, "error-registering-client")
 
     def request(self, data):
         """
@@ -249,6 +268,14 @@ class RedisRequester(object):
                     message_id=message_id)
         else:
             self._outstanding_requests[message_id].succeed(message)
+
+    def stop(self):
+        log.msg("redis-requester-stopping")
+        x = self._request_connection.do("srem", "txscale.clients", self.response_list_name)
+        def gotIt(r):
+            log.msg("redis-requester-done-stopping")
+        x.addCallback(gotIt)
+        return x
 
 
 class _ClientRequest(object):
