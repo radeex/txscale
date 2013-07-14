@@ -32,11 +32,16 @@ class FakeRedis(object):
         return succeed(None)
 
     def push(self, key, value, tail=False):
-        assert tail
+        assert tail is True
         self.model.lists[key].append(value)
         return succeed(None)
 
     def sadd(self, set_key, member):
+        self.model.sets[set_key].add(member)
+        return succeed(None)
+
+    def srem(self, set_key, member):
+        self.model.sets[set_key].remove(member)
         return succeed(None)
 
 
@@ -69,10 +74,41 @@ class RedisRequesterTests(TestCase):
             _redis=redis_factory)
         return requester
 
+    def _getPublishedRequests(self, list_name="txscale.test-service"):
+        return map(splitRequest, self.redis_model.lists[list_name])
+
+    def test_registration(self):
+        """
+        Clients get registered in the txscale.clients set.
+        """
+        requester = self.connect()
+        self.assertEqual(
+            self.redis_model.sets["txscale.clients"],
+            set([requester.response_list_name]))
+
+    def test_deregistration(self):
+        """
+        When a requester is stopped, it is removed from the txscale.clients set.
+        """
+        requester = self.connect()
+        requester.stop()
+        self.assertEqual(self.redis_model.sets["txscale.clients"], set())
+
     def test_request_pushes_request(self):
+        """
+        Requests are encoded and pushed onto a list representing the server's request queue.
+        """
         requester = self.connect()
         requester.request("request-data")
-        [request_data] = self.redis_model.lists["txscale.test-service"]
-        request = splitRequest(request_data)
+        [request] = self._getPublishedRequests()
         self.assertEqual(request.data, "request-data")
         self.assertEqual(request.response_channel, requester.response_list_name)
+
+    # def test_request_response(self):
+    #     """
+    #     The requester will fire the returned Deferred with the response sent from the responder.
+    #     """
+    #     requester = self.connect()
+    #     result = requester.request("request-data")
+
+    #     [request] = self._getPublishedRequests()
